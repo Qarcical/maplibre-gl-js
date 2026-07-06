@@ -261,6 +261,33 @@ export type CameraUpdateTransformFunction =  (next: {
     elevation?: number;
 };
 
+// PATCH (map2-fork): everything flyTo needs to fly — and preloadFlight needs to sample — a
+// flight path. Produced by Camera._prepareFlight; consumed by flyTo and _sampleFlightPath.
+type FlightPrep = {
+    options: FlyToOptions;
+    tr: ITransform;
+    flyToHandler: ReturnType<ICameraHelper['handleFlyTo']>;
+    /** ρ: the zooming curve parameter (after any minZoom adjustment). */
+    rho: number;
+    /** S: total flight-path length in ρ-screenfulls. */
+    S: number;
+    /** w(s): visible span on the ground, in pixels with respect to the initial scale. */
+    w: (s: number) => number;
+    /** u(s): distance along the path projected onto the ground plane, normalised to [0, 1]. */
+    u: (s: number) => number;
+    bearing: number;
+    pitch: number;
+    roll: number;
+    padding: PaddingOptions;
+    startBearing: number;
+    startPitch: number;
+    startRoll: number;
+    startPadding: PaddingOptions;
+    locationAtOffset: LngLat;
+    offsetAsPoint: Point;
+    pointAtOffset: Point;
+};
+
 export abstract class Camera extends Evented {
     transform: ITransform;
     cameraHelper: ICameraHelper;
@@ -1443,6 +1470,87 @@ export abstract class Camera extends Evented {
 
         this.stop();
 
+        const tr = this._getTransformForUpdate();
+        // PATCH (map2-fork): the whole path construction lives in _prepareFlight, shared with
+        // preloadFlight so a preloaded path can never drift from the flown one.
+        const prep = this._prepareFlight(options, tr);
+        if (!prep) {
+            // Perform a more or less instantaneous transition if the path is too short.
+            return this.easeTo(options, eventData);
+        }
+        options = prep.options;
+        const {flyToHandler, rho, S, w, u, bearing, pitch, roll, padding,
+            startBearing, startPitch, startRoll, startPadding, offsetAsPoint} = prep;
+        let {pointAtOffset} = prep;
+
+        if ('duration' in options) {
+            options.duration = +options.duration;
+        } else {
+            const V = 'screenSpeed' in options ? +options.screenSpeed / rho : +options.speed;
+            options.duration = 1000 * S / V;
+        }
+
+        if (options.maxDuration && options.duration > options.maxDuration) {
+            options.duration = 0;
+        }
+
+        // PATCH (map2-fork): opt-in — preload the viewports along the flight path before the
+        // first frame renders (see _sampleFlightPath). preloadFlight offers the same ahead of the
+        // flyTo call itself; tiles already pinned there dedupe here, so both together are cheap.
+        if (options.preloadTiles) {
+            for (const trSample of this._sampleFlightPath(prep)) {
+                this._preloadTransform(trSample).catch(() => {});
+            }
+        }
+
+        this._zooming = true;
+        this._rotating = (startBearing !== bearing);
+        this._pitching = (pitch !== startPitch);
+        this._rolling = (roll !== startRoll);
+        this._padding = !tr.isPaddingEqual(padding);
+
+        this._prepareEase(eventData, false);
+        if (this.terrain) this._prepareElevation(flyToHandler.targetCenter);
+
+        this._ease((k) => {
+            // s: The distance traveled along the flight path, measured in ρ-screenfulls.
+            const s = k * S;
+            const scale = 1 / w(s);
+            const centerFactor = u(s);
+            if (this._rotating) {
+                tr.setBearing(interpolates.number(startBearing, bearing, k));
+            }
+            if (this._pitching) {
+                tr.setPitch(interpolates.number(startPitch, pitch, k));
+            }
+            if (this._rolling) {
+                tr.setRoll(interpolates.number(startRoll, roll, k));
+            }
+            if (this._padding) {
+                tr.interpolatePadding(startPadding, padding, k);
+                // When padding is being applied, Transform.centerPoint is changing continuously,
+                // thus we need to recalculate offsetPoint every frame
+                pointAtOffset = tr.centerPoint.add(offsetAsPoint);
+            }
+
+            flyToHandler.easeFunc(k, scale, centerFactor, pointAtOffset);
+
+            if (this.terrain && !options.freezeElevation) this._updateElevation(k);
+            this._applyUpdatedTransform(tr);
+            this._fireMoveEvents(eventData);
+        }, () => {
+            if (this.terrain && options.freezeElevation) this._finalizeElevation();
+            this._afterEase(eventData);
+        }, options);
+
+        return this;
+    }
+
+    // PATCH (map2-fork): the front half of flyTo — the van Wijk (2003) path construction —
+    // extracted so preloadFlight can sample the exact path a later flyTo will fly. Returns null
+    // when the flight degenerates to an ease (flyTo falls back to easeTo; preloadFlight preloads
+    // just the destination). Read-only on `tr`; local variable documentation follows van Wijk.
+    _prepareFlight(options: FlyToOptions, tr: ITransform): FlightPrep | null {
         options = extend({
             offset: [0, 0],
             speed: 1.2,
@@ -1454,8 +1562,7 @@ export abstract class Camera extends Evented {
             options.zoom = evaluateZoomSnap(options.zoom, this._zoomSnap);
         }
 
-        const tr = this._getTransformForUpdate(),
-            startBearing = tr.bearing,
+        const startBearing = tr.bearing,
             startPitch = tr.pitch,
             startRoll = tr.roll,
             startPadding = tr.padding;
@@ -1466,7 +1573,7 @@ export abstract class Camera extends Evented {
         const padding = ('padding' in options ? options.padding : tr.padding) as PaddingOptions;
 
         const offsetAsPoint = Point.convert(options.offset);
-        let pointAtOffset = tr.centerPoint.add(offsetAsPoint);
+        const pointAtOffset = tr.centerPoint.add(offsetAsPoint);
         const locationAtOffset = tr.screenPointToLocation(pointAtOffset);
 
         const flyToHandler = this.cameraHelper.handleFlyTo(tr, {
@@ -1535,8 +1642,8 @@ export abstract class Camera extends Evented {
 
         // When u₀ = u₁, the optimal path doesn’t require both ascent and descent.
         if (Math.abs(u1) < 0.000002 || !isFinite(S)) {
-            // Perform a more or less instantaneous transition if the path is too short.
-            if (Math.abs(w0 - w1) < 0.000001) return this.easeTo(options, eventData);
+            // Too short a path for a flight — the caller falls back to an ease.
+            if (Math.abs(w0 - w1) < 0.000001) return null;
 
             const k = w1 < w0 ? -1 : 1;
             S = Math.abs(Math.log(w1 / w0)) / rho;
@@ -1545,89 +1652,86 @@ export abstract class Camera extends Evented {
             w = (s) => Math.exp(k * rho * s);
         }
 
-        if ('duration' in options) {
-            options.duration = +options.duration;
-        } else {
-            const V = 'screenSpeed' in options ? +options.screenSpeed / rho : +options.speed;
-            options.duration = 1000 * S / V;
+        return {
+            options, tr, flyToHandler, rho, S, w, u,
+            bearing, pitch, roll, padding,
+            startBearing, startPitch, startRoll, startPadding,
+            locationAtOffset, offsetAsPoint, pointAtOffset,
+        };
+    }
+
+    // PATCH (map2-fork): replay the real per-frame flight maths — the same w(s)/u(s) and the
+    // projection's own easeFunc — onto CLONES of the start transform at a few sample points
+    // (the zoomed-out apex and the descent), so the live transform is untouched. Used by flyTo's
+    // preloadTiles option and by preloadFlight.
+    _sampleFlightPath(prep: FlightPrep): ITransform[] {
+        const samples: ITransform[] = [];
+        for (const k of [0.25, 0.5, 0.75, 1]) {
+            const s = k * prep.S;
+            const trSample = prep.tr.clone();
+            const sampleHandler = this.cameraHelper.handleFlyTo(trSample, {
+                bearing: prep.bearing,
+                pitch: prep.pitch,
+                roll: prep.roll,
+                padding: prep.padding,
+                locationAtOffset: prep.locationAtOffset,
+                offsetAsPoint: prep.offsetAsPoint,
+                center: prep.options.center,
+                minZoom: prep.options.minZoom,
+                zoom: prep.options.zoom,
+            });
+            if (prep.startBearing !== prep.bearing) {
+                trSample.setBearing(interpolates.number(prep.startBearing, prep.bearing, k));
+            }
+            if (prep.pitch !== prep.startPitch) {
+                trSample.setPitch(interpolates.number(prep.startPitch, prep.pitch, k));
+            }
+            if (!prep.tr.isPaddingEqual(prep.padding)) {
+                trSample.interpolatePadding(prep.startPadding, prep.padding, k);
+            }
+            sampleHandler.easeFunc(k, 1 / prep.w(s), prep.u(s), trSample.centerPoint.add(prep.offsetAsPoint));
+            samples.push(trSample);
         }
+        return samples;
+    }
 
-        if (options.maxDuration && options.duration > options.maxDuration) {
-            options.duration = 0;
+    // PATCH (map2-fork): preload the tiles for a flyTo's ENTIRE path without flying it — for a
+    // scripted animation that knows a fly is coming (e.g. during the dwell after a reveal). Built
+    // by the same _prepareFlight as flyTo from the CURRENT camera, so the preloaded path is exact
+    // provided the camera does not move between this call and the flyTo. A degenerate (too-short)
+    // flight preloads just the destination. Resolves when every sampled viewport's tiles settle.
+    preloadFlight(options: FlyToOptions): Promise<void> {
+        const prep = this._prepareFlight(options, this.transform.clone());
+        if (!prep) {
+            return this.preloadCamera(pick(options, ['center', 'zoom', 'bearing', 'pitch', 'roll', 'elevation', 'padding']) as JumpToOptions);
         }
+        return Promise.allSettled(this._sampleFlightPath(prep).map((trSample) => this._preloadTransform(trSample))).then(() => {});
+    }
 
-        // PATCH (map2-fork): the flight path is fully determined at this point, so an opt-in
-        // caller (a scripted animation that knows it is about to fly here) can have the viewports
-        // along the path preloaded before the first frame renders. Each sample replays the real
-        // per-frame maths — the same w(s)/u(s) closures and the projection's own easeFunc — onto a
-        // CLONE of the start transform, so the live transform and the flight itself are untouched.
-        // Tiles already pinned/cached dedupe inside preloadTiles, so overlapping samples are cheap.
-        if (options.preloadTiles) {
-            for (const k of [0.25, 0.5, 0.75, 1]) {
-                const s = k * S;
-                const trSample = tr.clone();
-                const sampleHandler = this.cameraHelper.handleFlyTo(trSample, {
-                    bearing, pitch, roll, padding,
-                    locationAtOffset, offsetAsPoint,
-                    center: options.center,
-                    minZoom: options.minZoom,
-                    zoom: options.zoom,
-                });
-                if (startBearing !== bearing) {
-                    trSample.setBearing(interpolates.number(startBearing, bearing, k));
-                }
-                if (pitch !== startPitch) {
-                    trSample.setPitch(interpolates.number(startPitch, pitch, k));
-                }
-                if (!tr.isPaddingEqual(padding)) {
-                    trSample.interpolatePadding(startPadding, padding, k);
-                }
-                sampleHandler.easeFunc(k, 1 / w(s), u(s), trSample.centerPoint.add(offsetAsPoint));
-                this._preloadTransform(trSample).catch(() => {});
-            }
+    // PATCH (map2-fork): preload every source's tiles for a FUTURE camera position, so a scripted
+    // animation can prepay download + worker-parse before jumpTo/easeTo/flyTo arrives there. Takes
+    // the same options as jumpTo and applies them to a CLONE of the current transform, so viewport
+    // size and bearing/pitch defaults behave identically. Preloaded tiles are pinned (immune to
+    // cache eviction) until promoted on arrival or released via Map#releasePreloadedTiles.
+    preloadCamera(options: JumpToOptions): Promise<void> {
+        if ('zoom' in options && this._zoomSnap) {
+            options = extend({}, options, {zoom: evaluateZoomSnap(options.zoom, this._zoomSnap)});
         }
-
-        this._zooming = true;
-        this._rotating = (startBearing !== bearing);
-        this._pitching = (pitch !== startPitch);
-        this._rolling = (roll !== startRoll);
-        this._padding = !tr.isPaddingEqual(padding);
-
-        this._prepareEase(eventData, false);
-        if (this.terrain) this._prepareElevation(flyToHandler.targetCenter);
-
-        this._ease((k) => {
-            // s: The distance traveled along the flight path, measured in ρ-screenfulls.
-            const s = k * S;
-            const scale = 1 / w(s);
-            const centerFactor = u(s);
-            if (this._rotating) {
-                tr.setBearing(interpolates.number(startBearing, bearing, k));
-            }
-            if (this._pitching) {
-                tr.setPitch(interpolates.number(startPitch, pitch, k));
-            }
-            if (this._rolling) {
-                tr.setRoll(interpolates.number(startRoll, roll, k));
-            }
-            if (this._padding) {
-                tr.interpolatePadding(startPadding, padding, k);
-                // When padding is being applied, Transform.centerPoint is changing continuously,
-                // thus we need to recalculate offsetPoint every frame
-                pointAtOffset = tr.centerPoint.add(offsetAsPoint);
-            }
-
-            flyToHandler.easeFunc(k, scale, centerFactor, pointAtOffset);
-
-            if (this.terrain && !options.freezeElevation) this._updateElevation(k);
-            this._applyUpdatedTransform(tr);
-            this._fireMoveEvents(eventData);
-        }, () => {
-            if (this.terrain && options.freezeElevation) this._finalizeElevation();
-            this._afterEase(eventData);
-        }, options);
-
-        return this;
+        const tr = this.transform.clone();
+        this.cameraHelper.handleJumpToCenterZoom(tr, options);
+        if ('bearing' in options) {
+            tr.setBearing(+options.bearing);
+        }
+        if ('pitch' in options) {
+            tr.setPitch(+options.pitch);
+        }
+        if ('roll' in options) {
+            tr.setRoll(+options.roll);
+        }
+        if (options.padding != null) {
+            tr.setPadding(options.padding);
+        }
+        return this._preloadTransform(tr);
     }
 
     // PATCH (map2-fork): preload the tiles covering a future transform. Camera has no access to

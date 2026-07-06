@@ -1,4 +1,4 @@
-import {ensureError, extend, warnOnce, uniqueId, isImageBitmap, type Complete, pick, type Subscription, evaluateZoomSnap} from '../util/util';
+import {ensureError, extend, warnOnce, uniqueId, isImageBitmap, type Complete, pick, type Subscription} from '../util/util';
 import {browser} from '../util/browser';
 import {now} from '../util/time_control';
 import {DOM} from '../util/dom';
@@ -11,7 +11,7 @@ import {EvaluationParameters} from '../style/evaluation_parameters';
 import {Painter} from '../render/painter';
 import {Hash} from './hash';
 import {HandlerManager} from './handler_manager';
-import {Camera, type CameraOptions, type CameraUpdateTransformFunction, type FitBoundsOptions, type JumpToOptions} from './camera';
+import {Camera, type CameraOptions, type CameraUpdateTransformFunction, type FitBoundsOptions} from './camera';
 import {LngLat} from '../geo/lng_lat';
 import {LngLatBounds} from '../geo/lng_lat_bounds';
 import Point from '@mapbox/point-geometry';
@@ -2514,34 +2514,6 @@ export class Map extends Camera {
         } else {
             tileManager.refreshTiles(tileIds.map((tileId) => {return new CanonicalTileID(tileId.z, tileId.x, tileId.y);}));
         }
-    }
-
-    // PATCH (map2-fork): preload every source's tiles for a FUTURE camera position, so a scripted
-    // animation (which knows exactly where it is going) can prepay download + worker-parse before
-    // jumpTo/easeTo/flyTo arrives there. Takes the same CameraOptions as jumpTo; the future
-    // transform is a clone of the current one with those options applied, so viewport size,
-    // bearing/pitch defaults, and padding behave identically. Preloaded tiles are pinned (immune
-    // to cache eviction) until promoted on arrival or released via releasePreloadedTiles().
-    // Resolves when all sources have fetched+parsed their covering tiles (errors settle too).
-    preloadCamera(options: JumpToOptions): Promise<void> {
-        if ('zoom' in options && this._zoomSnap) {
-            options = extend({}, options, {zoom: evaluateZoomSnap(options.zoom, this._zoomSnap)});
-        }
-        const tr = this.transform.clone();
-        this.cameraHelper.handleJumpToCenterZoom(tr, options);
-        if ('bearing' in options) {
-            tr.setBearing(+options.bearing);
-        }
-        if ('pitch' in options) {
-            tr.setPitch(+options.pitch);
-        }
-        if ('roll' in options) {
-            tr.setRoll(+options.roll);
-        }
-        if (options.padding != null) {
-            tr.setPadding(options.padding);
-        }
-        return this._preloadTransform(tr);
     }
 
     // PATCH (map2-fork): Camera's no-op stub overridden with the real fan-out — preload every
