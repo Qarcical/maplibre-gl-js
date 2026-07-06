@@ -123,6 +123,10 @@ export type SetClusterOptions = {
  */
 export class GeoJSONSource extends Evented implements Source {
     type: 'geojson';
+    // PATCH (map2-fork): tiles come from the local worker's index in ~ms — nothing worth
+    // preloading ahead of a camera move (and overlay-style GeoJSON that setData()s frequently
+    // would only ever produce stale pins). See Source.preloadable.
+    readonly preloadable = false;
     id: string;
     minzoom: number;
     maxzoom: number;

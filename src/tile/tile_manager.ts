@@ -603,6 +603,7 @@ export class TileManager extends Evented {
         if (!this._sourceLoaded || this._paused) return;
         if (!this.used && !this.usedForTerrain) return;
         if (this._source.tileID) return;   // image source: nothing tiled to preload
+        if (this._source.preloadable === false) return;   // local-tiled source: preload buys nothing
 
         let idealTileIDs = coveringTiles(transform, {
             tileSize: this.usedForTerrain ? this.tileSize : this._source.tileSize,

@@ -54,6 +54,13 @@ export interface Source {
      * `true` if zoom levels are rounded to the nearest integer in the source data, `false` if they are floor-ed to the nearest integer.
      */
     roundZoom?: boolean;
+
+    /**
+     * PATCH (map2-fork): set `false` for sources whose tiles are generated locally (no network
+     * fetch, no heavy decode) — preloading them ahead of a camera move buys nothing, so
+     * TileManager.preloadTiles skips them. Absent/`true` means the source benefits from preload.
+     */
+    readonly preloadable?: boolean;
     /**
      * `false` if tiles can be drawn outside their boundaries, `true` if they cannot.
      */
