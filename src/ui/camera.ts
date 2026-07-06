@@ -123,6 +123,14 @@ export type CameraForBoundsOptions = CameraOptions & {
  */
 export type FlyToOptions = AnimationOptions & CameraOptions & {
     /**
+     * PATCH (map2-fork): preload the tiles for viewports along the flight path (sampled at a few
+     * points including the zoomed-out apex and the destination) before the flight starts, so a
+     * scripted animation flies over already-parsed tiles instead of popping them in reactively.
+     * Preloaded tiles are pinned until used or until {@link Map.releasePreloadedTiles} is called.
+     * @defaultValue false
+     */
+    preloadTiles?: boolean;
+    /**
      * The zooming "curve" that will occur along the
      * flight path. A high value maximizes zooming for an exaggerated animation, while a low
      * value minimizes zooming for an effect closer to {@link Map.easeTo}. 1.42 is the average
@@ -1548,6 +1556,37 @@ export abstract class Camera extends Evented {
             options.duration = 0;
         }
 
+        // PATCH (map2-fork): the flight path is fully determined at this point, so an opt-in
+        // caller (a scripted animation that knows it is about to fly here) can have the viewports
+        // along the path preloaded before the first frame renders. Each sample replays the real
+        // per-frame maths — the same w(s)/u(s) closures and the projection's own easeFunc — onto a
+        // CLONE of the start transform, so the live transform and the flight itself are untouched.
+        // Tiles already pinned/cached dedupe inside preloadTiles, so overlapping samples are cheap.
+        if (options.preloadTiles) {
+            for (const k of [0.25, 0.5, 0.75, 1]) {
+                const s = k * S;
+                const trSample = tr.clone();
+                const sampleHandler = this.cameraHelper.handleFlyTo(trSample, {
+                    bearing, pitch, roll, padding,
+                    locationAtOffset, offsetAsPoint,
+                    center: options.center,
+                    minZoom: options.minZoom,
+                    zoom: options.zoom,
+                });
+                if (startBearing !== bearing) {
+                    trSample.setBearing(interpolates.number(startBearing, bearing, k));
+                }
+                if (pitch !== startPitch) {
+                    trSample.setPitch(interpolates.number(startPitch, pitch, k));
+                }
+                if (!tr.isPaddingEqual(padding)) {
+                    trSample.interpolatePadding(startPadding, padding, k);
+                }
+                sampleHandler.easeFunc(k, 1 / w(s), u(s), trSample.centerPoint.add(offsetAsPoint));
+                this._preloadTransform(trSample).catch(() => {});
+            }
+        }
+
         this._zooming = true;
         this._rotating = (startBearing !== bearing);
         this._pitching = (pitch !== startPitch);
@@ -1589,6 +1628,13 @@ export abstract class Camera extends Evented {
         }, options);
 
         return this;
+    }
+
+    // PATCH (map2-fork): preload the tiles covering a future transform. Camera has no access to
+    // the style's sources, so this is a no-op here; Map overrides it with the real fan-out. flyTo
+    // uses it to prefetch its sampled flight path when `preloadTiles: true` is passed.
+    _preloadTransform(_tr: ITransform): Promise<void> {
+        return Promise.resolve();
     }
 
     isEasing() {

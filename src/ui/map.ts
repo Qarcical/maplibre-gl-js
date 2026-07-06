@@ -2541,6 +2541,13 @@ export class Map extends Camera {
         if (options.padding != null) {
             tr.setPadding(options.padding);
         }
+        return this._preloadTransform(tr);
+    }
+
+    // PATCH (map2-fork): Camera's no-op stub overridden with the real fan-out — preload every
+    // source's tiles for the given future transform. Also reached by flyTo's `preloadTiles`
+    // option, which samples its flight path and preloads each sampled viewport through this.
+    override _preloadTransform(tr: ITransform): Promise<void> {
         const managers = Object.values(this.style?.tileManagers ?? {});
         return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr))).then(() => {});
     }
