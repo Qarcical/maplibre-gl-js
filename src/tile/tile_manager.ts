@@ -600,8 +600,15 @@ export class TileManager extends Evented {
     // (loaded or errored). Tiles already in view, already pinned, or already cached are reused.
     // Not supported for image sources or terrain-ancestor expansion (unused by our exports).
     async preloadTiles(transform: ITransform): Promise<void> {
-        if (!this._sourceLoaded || this._paused) return;
-        if (!this.used && !this.usedForTerrain) return;
+        const debug = this.map?._preloadDebug;
+        if (!this._sourceLoaded || this._paused) {
+            if (debug) console.log(`[map2-fork] preload '${this.id}' skipped: ${this._paused ? 'paused' : 'source not loaded'}`);
+            return;
+        }
+        if (!this.used && !this.usedForTerrain) {
+            if (debug) console.log(`[map2-fork] preload '${this.id}' skipped: unused by any layer`);
+            return;
+        }
         if (this._source.tileID) return;   // image source: nothing tiled to preload
         if (this._source.preloadable === false) return;   // local-tiled source: preload buys nothing
 
@@ -621,23 +628,32 @@ export class TileManager extends Evented {
         }
 
         const loads: Promise<void>[] = [];
+        let inView = 0, alreadyPinned = 0, fromCache = 0;
         for (const tileID of idealTileIDs) {
             if (this._inViewTiles.getTileById(tileID.key)) {
+                inView++;
                 continue;
             }
             const pinned = this._preloadedTiles[tileID.key];
             if (pinned) {
                 // re-preloading signals renewed interest — refresh the pin's TTL
                 pinned.staleAfterUpdate = this._updateCount + TileManager.preloadedTileTTLUpdates;
+                alreadyPinned++;
                 continue;
             }
             let tile = this._outOfViewCache.getAndRemove(tileID);
+            if (tile) {
+                fromCache++;
+            }
             if (!tile) {
                 tile = new Tile(tileID, this._source.tileSize * tileID.overscaleFactor());
                 this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
                 loads.push(this._loadTile(tile, tileID.key, tile.state));
             }
             this._preloadedTiles[tileID.key] = {tile, staleAfterUpdate: this._updateCount + TileManager.preloadedTileTTLUpdates};
+        }
+        if (debug) {
+            console.log(`[map2-fork] preload '${this.id}': ${idealTileIDs.length} covering → ${loads.length} new loads, ${fromCache} from cache, ${alreadyPinned} already pinned, ${inView} in view`);
         }
         await Promise.allSettled(loads);
     }

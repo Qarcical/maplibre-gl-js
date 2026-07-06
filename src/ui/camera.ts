@@ -1665,8 +1665,28 @@ export abstract class Camera extends Evented {
     // (the zoomed-out apex and the descent), so the live transform is untouched. Used by flyTo's
     // preloadTiles option and by preloadFlight.
     _sampleFlightPath(prep: FlightPrep): ITransform[] {
+        // Sample at every INTEGER display-zoom crossing along the flight, plus the destination.
+        // Fixed fractional samples miss most tile-zoom rings on a long flight — a z17→z9 flight
+        // (via a ~z7 apex) crosses ~13 rings, and 4 fractional samples touch only ~4 of them, so
+        // the sweep between loaded reactively (visible pop mid-flight). zoom(s) is smooth and
+        // cheap (one cosh per evaluation), so walk k in small steps and emit a sample whenever
+        // the integer part of the display zoom changes. Capped for pathological spans.
+        const startZoom = prep.tr.zoom;
+        const ks: number[] = [];
+        let prevZ = Math.floor(startZoom);
+        const SCAN_STEPS = 96;
+        for (let i = 1; i < SCAN_STEPS && ks.length < 24; i++) {
+            const k = i / SCAN_STEPS;
+            const z = Math.floor(startZoom + scaleZoom(1 / prep.w(k * prep.S)));
+            if (z !== prevZ) {
+                ks.push(k);
+                prevZ = z;
+            }
+        }
+        ks.push(1);
+
         const samples: ITransform[] = [];
-        for (const k of [0.25, 0.5, 0.75, 1]) {
+        for (const k of ks) {
             const s = k * prep.S;
             const trSample = prep.tr.clone();
             const sampleHandler = this.cameraHelper.handleFlyTo(trSample, {
@@ -1701,6 +1721,9 @@ export abstract class Camera extends Evented {
     // provided the camera does not move between this call and the flyTo. A degenerate (too-short)
     // flight preloads just the destination. Resolves when every sampled viewport's tiles settle.
     preloadFlight(options: FlyToOptions): Promise<void> {
+        if (this._preloadDebug) {
+            console.log('[map2-fork] preloadFlight', JSON.stringify({center: options.center, zoom: options.zoom}));
+        }
         const prep = this._prepareFlight(options, this.transform.clone());
         if (!prep) {
             return this.preloadCamera(pick(options, ['center', 'zoom', 'bearing', 'pitch', 'roll', 'elevation', 'padding']) as JumpToOptions);
@@ -1714,6 +1737,9 @@ export abstract class Camera extends Evented {
     // size and bearing/pitch defaults behave identically. Preloaded tiles are pinned (immune to
     // cache eviction) until promoted on arrival or released via Map#releasePreloadedTiles.
     preloadCamera(options: JumpToOptions): Promise<void> {
+        if (this._preloadDebug) {
+            console.log('[map2-fork] preloadCamera', JSON.stringify({center: options.center, zoom: options.zoom}));
+        }
         if ('zoom' in options && this._zoomSnap) {
             options = extend({}, options, {zoom: evaluateZoomSnap(options.zoom, this._zoomSnap)});
         }
@@ -1733,6 +1759,10 @@ export abstract class Camera extends Evented {
         }
         return this._preloadTransform(tr);
     }
+
+    // PATCH (map2-fork): when true, every preload entry point logs what it requested and every
+    // TileManager logs what it did with it (new loads / dedupes / skip reasons). Diagnostics only.
+    _preloadDebug?: boolean;
 
     // PATCH (map2-fork): preload the tiles covering a future transform. Camera has no access to
     // the style's sources, so this is a no-op here; Map overrides it with the real fan-out. flyTo
