@@ -56,7 +56,9 @@ function renderColorRelief(
     const program = painter.useProgram('colorRelief');
     const align = !painter.options.moving;
 
-    const textureFilter = layer.paint.get('resampling') === 'nearest' ?  gl.NEAREST : gl.LINEAR;
+    // PATCH (map2-fork): the DEM texture is R32F; LINEAR on float textures needs
+    // OES_texture_float_linear — fall back to NEAREST without it.
+    const textureFilter = (layer.paint.get('resampling') === 'nearest' || !context.floatTextureLinearSupported) ? gl.NEAREST : gl.LINEAR;
 
     let firstTile = true;
     let colorRampSize = 0;
@@ -68,7 +70,7 @@ function renderColorRelief(
             // we should avoid calling gl.getParameter at runtime (GPU stall risk)
             textureMaxSize ||= gl.getParameter(gl.MAX_TEXTURE_SIZE);
             const maxLength = textureMaxSize;
-            const {elevationTexture, colorTexture} = layer.getColorRampTextures(context, maxLength, dem.getUnpackVector());
+            const {elevationTexture, colorTexture} = layer.getColorRampTextures(context, maxLength);
             context.activeTexture.set(gl.TEXTURE1);
             elevationTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
             context.activeTexture.set(gl.TEXTURE4);
@@ -81,19 +83,19 @@ function renderColorRelief(
             continue;
         }
 
-        const textureStride = dem.stride;
-
-        const pixelData = dem.getPixels();
+        // PATCH (map2-fork): upload the DEM as a single-channel R32F texture in METRES so the GPU
+        // filters linear heights (see color_relief.fragment.glsl). Never pooled — the painter's
+        // tile-texture pool is RGBA and recycling a float texture there would corrupt later users.
+        const pixelData = dem.getFloatPixels();
         context.activeTexture.set(gl.TEXTURE0);
 
         context.pixelStoreUnpackPremultiplyAlpha.set(false);
-        tile.demTexture ||= painter.getTileTexture(textureStride);
         if (tile.demTexture) {
             const demTexture = tile.demTexture;
             demTexture.update(pixelData, {premultiply: false});
             demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
         } else {
-            tile.demTexture = new Texture(context, pixelData, gl.RGBA, {premultiply: false});
+            tile.demTexture = new Texture(context, pixelData, (gl as WebGL2RenderingContext).R32F, {premultiply: false});
             tile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
         }
 

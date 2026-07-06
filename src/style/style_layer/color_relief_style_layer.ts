@@ -9,7 +9,6 @@ import {warnOnce} from '../../util/util';
 import {Texture} from '../../webgl/texture';
 import {RGBAImage} from '../../util/image';
 import {type Context} from '../../webgl/context';
-import {packDEMData} from '../../data/dem_data';
 
 export const isColorReliefStyleLayer = (layer: StyleLayer): layer is ColorReliefStyleLayer => layer.type === 'color-relief';
 
@@ -78,20 +77,21 @@ export class ColorReliefStyleLayer extends StyleLayer {
         return this.colorRampExpression != this._transitionablePaint._values['color-relief-color'].value.expression;
     }
 
-    getColorRampTextures(context: Context, maxLength: number, unpackVector: number[]): ColorRampTextures {
+    getColorRampTextures(context: Context, maxLength: number): ColorRampTextures {
         if (this.colorRampTextures && !this._colorRampChanged()) {
             return this.colorRampTextures;
         }
         const colorRamp = this._createColorRamp(maxLength);
         const colorImage = new RGBAImage({width: colorRamp.colorStops.length, height: 1});
-        const elevationImage = new RGBAImage({width: colorRamp.colorStops.length, height: 1});
+        // PATCH (map2-fork): stops go up as an R32F texture in METRES (the DEM texture is linear
+        // float now), so no packing against the source's unpack vector — and no dependency on it.
+        const elevationData = new Float32Array(colorRamp.elevationStops.length);
         for (let i = 0; i < colorRamp.elevationStops.length; i++) {
-            const elevationPacked = packDEMData(colorRamp.elevationStops[i], unpackVector);
-            elevationImage.setPixel(0, i, new Color(elevationPacked.r/255, elevationPacked.g/255, elevationPacked.b/255, 1));
+            elevationData[i] = colorRamp.elevationStops[i];
             colorImage.setPixel(0, i, colorRamp.colorStops[i]);
         }
         this.colorRampTextures = {
-            elevationTexture: new Texture(context, elevationImage, context.gl.RGBA),
+            elevationTexture: new Texture(context, {width: colorRamp.elevationStops.length, height: 1, data: elevationData}, (context.gl as WebGL2RenderingContext).R32F),
             colorTexture: new Texture(context, colorImage, context.gl.RGBA)
         };
         return this.colorRampTextures;

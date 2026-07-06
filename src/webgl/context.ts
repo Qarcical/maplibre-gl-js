@@ -32,6 +32,8 @@ export class Context {
 
     currentNumAttributes: number;
     maxTextureSize: number;
+    // PATCH (map2-fork): OES_texture_float_linear available (R32F DEM textures may bind LINEAR).
+    floatTextureLinearSupported: boolean;
 
     clearColor: ClearColor;
     clearDepth: ClearDepth;
@@ -112,6 +114,10 @@ export class Context {
         }
 
         this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+
+        // PATCH (map2-fork): LINEAR filtering of float textures (the R32F DEM) needs this
+        // extension; without it we fall back to NEAREST on those textures.
+        this.floatTextureLinearSupported = !!gl.getExtension('OES_texture_float_linear');
 
         if (isWebGL2(gl)) {
             this.HALF_FLOAT = gl.HALF_FLOAT;

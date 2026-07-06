@@ -31,7 +31,6 @@ export type TerrainData = {
     'u_terrain': number;
     'u_terrain_dim': number;
     'u_terrain_matrix': mat4;
-    'u_terrain_unpack': number[];
     'u_terrain_exaggeration': number;
     texture: WebGLTexture;
     depthTexture: WebGLTexture;
@@ -128,7 +127,6 @@ export class Terrain {
     /**
      * variables for an empty dem texture, which is used while the raster-dem tile is loading.
      */
-    _emptyDemUnpack: number[];
     _emptyDemTexture: Texture;
     _emptyDemMatrix: mat4;
     /**
@@ -268,8 +266,8 @@ export class Terrain {
             const context = this.painter.context;
             const image = new RGBAImage({width: 1, height: 1}, new Uint8Array(1 * 4));
             this._emptyDepthTexture = new Texture(context, image, context.gl.RGBA, {premultiply: false});
-            this._emptyDemUnpack = [0, 0, 0, 0];
-            this._emptyDemTexture = new Texture(context, new RGBAImage({width: 1, height: 1}), context.gl.RGBA, {premultiply: false});
+            // PATCH (map2-fork): the DEM texture is single-channel float (metres) — see below.
+            this._emptyDemTexture = new Texture(context, {width: 1, height: 1, data: new Float32Array(1)}, (context.gl as WebGL2RenderingContext).R32F, {premultiply: false});
             this._emptyDemTexture.bind(context.gl.NEAREST, context.gl.CLAMP_TO_EDGE);
             this._emptyDemMatrix = mat4.identity([] as any);
         }
@@ -277,9 +275,10 @@ export class Terrain {
         const sourceTile = this.tileManager.getSourceTile(tileID, true);
         if (sourceTile?.dem && (!sourceTile.demTexture || sourceTile.needsTerrainPrepare)) {
             const context = this.painter.context;
-            sourceTile.demTexture = this.painter.getTileTexture(sourceTile.dem.stride);
-            if (sourceTile.demTexture) sourceTile.demTexture.update(sourceTile.dem.getPixels(), {premultiply: false});
-            else sourceTile.demTexture = new Texture(context, sourceTile.dem.getPixels(), context.gl.RGBA, {premultiply: false});
+            // PATCH (map2-fork): R32F metres, shared tile.demTexture with hillshade/color-relief.
+            // Never pooled (the painter's tile-texture pool is RGBA-only).
+            if (sourceTile.demTexture) sourceTile.demTexture.update(sourceTile.dem.getFloatPixels(), {premultiply: false});
+            else sourceTile.demTexture = new Texture(context, sourceTile.dem.getFloatPixels(), (context.gl as WebGL2RenderingContext).R32F, {premultiply: false});
             sourceTile.demTexture.bind(context.gl.NEAREST, context.gl.CLAMP_TO_EDGE);
             sourceTile.needsTerrainPrepare = false;
         }
@@ -304,7 +303,6 @@ export class Terrain {
             'u_terrain': 3,
             'u_terrain_dim': sourceTile?.dem?.dim || 1,
             'u_terrain_matrix': matrixKey ? this._demMatrixCache[matrixKey].matrix : this._emptyDemMatrix,
-            'u_terrain_unpack': sourceTile?.dem?.getUnpackVector() || this._emptyDemUnpack,
             'u_terrain_exaggeration': this.exaggeration,
             texture: (sourceTile?.demTexture || this._emptyDemTexture).texture,
             depthTexture: (this._fboDepthTexture || this._emptyDepthTexture).texture,

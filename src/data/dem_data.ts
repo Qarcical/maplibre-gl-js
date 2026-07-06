@@ -136,8 +136,29 @@ export class DEMData {
         return new RGBAImage({width: this.stride, height: this.stride}, new Uint8Array(this.data.buffer));
     }
 
+    // PATCH (map2-fork): the DEM decoded to METRES as a single-channel Float32 image (stride²,
+    // border included) — uploaded as an R32F texture so the GPU bilinear-filters linear heights,
+    // never packed bytes. (Filtering packed terrarium/custom bytes blends each channel separately
+    // and unpacks the blend — worst at 0 m, where the carry byte flips 127→128 and a blended R
+    // contributes a spurious ±128 m.) Lazily built and cached; backfillBorder invalidates.
+    _floatData: Float32Array | null = null;
+
+    getFloatPixels(): {width: number; height: number; data: Float32Array} {
+        if (!this._floatData) {
+            const pixels = new Uint8Array(this.data.buffer);
+            const out = new Float32Array(this.stride * this.stride);
+            for (let i = 0; i < out.length; i++) {
+                const j = i * 4;
+                out[i] = this.unpack(pixels[j], pixels[j + 1], pixels[j + 2]);
+            }
+            this._floatData = out;
+        }
+        return {width: this.stride, height: this.stride, data: this._floatData};
+    }
+
     backfillBorder(borderTile: DEMData, dx: number, dy: number) {
         if (this.dim !== borderTile.dim) throw new Error('dem dimension mismatch');
+        this._floatData = null;   // PATCH (map2-fork): packed data changes below — refresh floats on next use
 
         let xMin = dx * this.dim,
             xMax = dx * this.dim + this.dim,

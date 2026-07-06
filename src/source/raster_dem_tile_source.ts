@@ -150,7 +150,9 @@ export class RasterDEMTileSource extends RasterTileSource implements Source {
     }
 
     async unloadTile(tile: Tile) {
-        if (tile.demTexture) this.map.painter.saveTileTexture(tile.demTexture);
+        // PATCH (map2-fork): demTexture is R32F (single-channel float) — the painter's tile
+        // texture pool is RGBA-only, so recycling it there would corrupt later users. Destroy it.
+        if (tile.demTexture) tile.demTexture.destroy();
         if (tile.fbo) {
             tile.fbo.destroy();
             delete tile.fbo;

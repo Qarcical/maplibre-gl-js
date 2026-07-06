@@ -2,7 +2,8 @@ import type {Context} from './context';
 import type {RGBAImage, AlphaImage} from '../util/image';
 import {premultiplyAlpha} from '../util/image';
 
-export type TextureFormat = WebGLRenderingContextBase['RGBA'] | WebGLRenderingContextBase['ALPHA'];
+// PATCH (map2-fork): R32F added for single-channel float DEM textures (heights in metres).
+export type TextureFormat = WebGLRenderingContextBase['RGBA'] | WebGLRenderingContextBase['ALPHA'] | WebGL2RenderingContext['R32F'];
 export type TextureFilter = WebGLRenderingContextBase['LINEAR'] | WebGLRenderingContextBase['LINEAR_MIPMAP_NEAREST'] | WebGLRenderingContextBase['NEAREST'];
 export type TextureWrap = WebGLRenderingContextBase['REPEAT'] | WebGLRenderingContextBase['CLAMP_TO_EDGE'] | WebGLRenderingContextBase['MIRRORED_REPEAT'];
 
@@ -12,7 +13,14 @@ type EmptyImage = {
     data: null;
 };
 
-type DataTextureImage = RGBAImage | AlphaImage | EmptyImage;
+// PATCH (map2-fork): raw single-channel float pixels (e.g. a DEM in metres) for R32F upload.
+type Float32Image = {
+    width: number;
+    height: number;
+    data: Float32Array;
+};
+
+type DataTextureImage = RGBAImage | AlphaImage | EmptyImage | Float32Image;
 export type TextureImage = TexImageSource | DataTextureImage;
 
 function hasDataProperty(image: TextureImage): image is DataTextureImage {
@@ -102,8 +110,14 @@ export class Texture {
 
     private _uploadRawData(image: DataTextureImage, wantPremultiply: boolean, width: number, height: number, gl: WebGLRenderingContext | WebGL2RenderingContext) {
         let {data} = image;
-        if (wantPremultiply && data) data = premultiplyAlpha(data);
-        gl.texImage2D(gl.TEXTURE_2D, 0, this.format, width, height, 0, this.format, gl.UNSIGNED_BYTE, data);
+        // PATCH (map2-fork): single-channel float upload (R32F internal, RED/FLOAT client format).
+        if (this.format === (gl as WebGL2RenderingContext).R32F) {
+            const gl2 = gl as WebGL2RenderingContext;
+            gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.R32F, width, height, 0, gl2.RED, gl2.FLOAT, data as Float32Array | null);
+            return;
+        }
+        if (wantPremultiply && data) data = premultiplyAlpha(data as Uint8Array);
+        gl.texImage2D(gl.TEXTURE_2D, 0, this.format, width, height, 0, this.format, gl.UNSIGNED_BYTE, data as Uint8Array | null);
     }
 
     private _updateDomImage(image: TexImageSource, x: number, y: number, gl: WebGLRenderingContext | WebGL2RenderingContext) {
@@ -112,8 +126,14 @@ export class Texture {
 
     private _updateRawData(image: DataTextureImage, wantPremultiply: boolean, x: number, y: number, width: number, height: number, gl: WebGLRenderingContext | WebGL2RenderingContext) {
         let {data} = image;
-        if (wantPremultiply && data) data = premultiplyAlpha(data);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        // PATCH (map2-fork): single-channel float sub-update, matching _uploadRawData.
+        if (this.format === (gl as WebGL2RenderingContext).R32F) {
+            const gl2 = gl as WebGL2RenderingContext;
+            gl2.texSubImage2D(gl2.TEXTURE_2D, 0, x, y, width, height, gl2.RED, gl2.FLOAT, data as Float32Array | null);
+            return;
+        }
+        if (wantPremultiply && data) data = premultiplyAlpha(data as Uint8Array);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data as Uint8Array | null);
     }
 
     bind(filter: TextureFilter, wrap: TextureWrap, minFilter?: TextureFilter | null) {

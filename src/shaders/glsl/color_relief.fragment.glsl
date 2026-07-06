@@ -3,7 +3,6 @@ precision highp float;
 #endif
 
 uniform sampler2D u_image;
-uniform vec4 u_unpack;
 uniform sampler2D u_elevation_stops;
 uniform sampler2D u_color_stops;
 uniform int u_color_ramp_size;
@@ -12,18 +11,16 @@ uniform float u_opacity;
 in vec2 v_pos;
 
 float getElevation(vec2 coord) {
-    // Convert encoded elevation value to meters
-    vec4 data = texture(u_image, coord) * 255.0;
-    data.a = -1.0;
-    return dot(data, u_unpack);
+    // PATCH (map2-fork): u_image is a single-channel R32F texture holding METRES, so hardware
+    // bilinear interpolates linear heights — no unpack of filtered packed bytes (which corrupted
+    // elevations, worst at 0 m where the terrarium carry byte flips).
+    return texture(u_image, coord).r;
 }
 
 float getElevationStop(int stop) {
-    // Convert encoded elevation value to meters
+    // PATCH (map2-fork): stops are an R32F texture in metres too.
     float x = (float(stop)+0.5)/float(u_color_ramp_size);
-    vec4 data = texture(u_elevation_stops, vec2(x, 0)) * 255.0;
-    data.a = -1.0;
-    return dot(data, u_unpack);
+    return texture(u_elevation_stops, vec2(x, 0)).r;
 }
 
 void main() {

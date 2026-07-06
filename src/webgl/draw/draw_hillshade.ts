@@ -120,17 +120,19 @@ function prepareHillshade(
         const tileSize = dem.dim;
         const textureStride = dem.stride;
 
-        const pixelData = dem.getPixels();
+        // PATCH (map2-fork): the DEM uploads as R32F metres (shared tile.demTexture with
+        // color-relief; see draw_color_relief.ts). NEAREST as before — the prepare pass taps
+        // exact texel centres. Never pooled (the pool is RGBA-only).
+        const pixelData = dem.getFloatPixels();
         context.activeTexture.set(gl.TEXTURE1);
 
         context.pixelStoreUnpackPremultiplyAlpha.set(false);
-        tile.demTexture ||= painter.getTileTexture(textureStride);
         if (tile.demTexture) {
             const demTexture = tile.demTexture;
             demTexture.update(pixelData, {premultiply: false});
             demTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
         } else {
-            tile.demTexture = new Texture(context, pixelData, gl.RGBA, {premultiply: false});
+            tile.demTexture = new Texture(context, pixelData, (gl as WebGL2RenderingContext).R32F, {premultiply: false});
             tile.demTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
         }
 

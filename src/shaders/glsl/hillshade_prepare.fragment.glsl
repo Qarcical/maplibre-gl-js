@@ -8,13 +8,11 @@ in vec2 v_pos;
 
 uniform vec2 u_dimension;
 uniform float u_zoom;
-uniform vec4 u_unpack;
 
 float getElevation(vec2 coord, float bias) {
-    // Convert encoded elevation value to meters
-    vec4 data = texture(u_image, coord) * 255.0;
-    data.a = -1.0;
-    return dot(data, u_unpack);
+    // PATCH (map2-fork): u_image is a single-channel R32F texture holding METRES (see
+    // color_relief.fragment.glsl) — read directly, no unpack.
+    return texture(u_image, coord).r;
 }
 
 void main() {

@@ -91,7 +91,6 @@ mat3 rotationMatrixFromAxisAngle(vec3 u, float angle) {
 uniform sampler2D u_terrain;
 uniform float u_terrain_dim;
 uniform mat4 u_terrain_matrix;
-uniform vec4 u_terrain_unpack;
 uniform float u_terrain_exaggeration;
 uniform highp sampler2D u_depth;
 #endif
@@ -135,8 +134,8 @@ float calculate_visibility(vec4 pos) {
 // grab an elevation value from a raster-dem texture
 float ele(vec2 pos) {
     #ifdef TERRAIN3D
-        vec4 rgb = (texture(u_terrain, pos) * 255.0) * u_terrain_unpack;
-        return rgb.r + rgb.g + rgb.b - u_terrain_unpack.a;
+        // PATCH (map2-fork): u_terrain is a single-channel R32F texture holding METRES.
+        return texture(u_terrain, pos).r;
     #else
         return 0.0;
     #endif
