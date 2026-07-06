@@ -75,7 +75,7 @@ import type {StyleGlyph} from './style/style_glyph';
 import type {FeatureIndex} from './data/feature_index';
 import type {DashEntry} from './render/line_atlas';
 import type {Painter} from './render/painter';
-const version = packageJSON.version;
+const version = packageJSON.version + '-map2fork';   // fork marker: getVersion() confirms our build is live
 
 export type * from '@maplibre/maplibre-gl-style-spec';
 
