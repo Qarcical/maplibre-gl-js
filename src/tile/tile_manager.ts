@@ -80,7 +80,9 @@ export class TileManager extends Evented {
     // Held outside _outOfViewCache so the current viewport's LRU pressure cannot evict them before
     // the camera arrives. _addTile promotes them into the in-view set; releasePreloadedTiles hands
     // any leftovers back to the LRU.
-    _preloadedTiles: Record<string, Tile> = {};
+    _preloadedTiles: Record<string, {tile: Tile; staleAfterUpdate: number}> = {};
+    // PATCH (map2-fork): update() counter driving the pin TTL sweep (see preloadedTileTTLUpdates).
+    _updateCount: number = 0;
     _timers: Record<string, ReturnType<typeof setTimeout>>;
     _maxTileCacheSize: number;
     _maxTileCacheZoomLevels: number;
@@ -99,6 +101,10 @@ export class TileManager extends Evented {
 
     static maxUnderzooming: number = 10;
     static maxOverzooming: number = 3;
+    // PATCH (map2-fork): a pinned preload not promoted within this many update() calls is
+    // auto-released (loaded → LRU, in-flight → aborted) — the backstop for a caller that
+    // preloads and never arrives nor calls releasePreloadedTiles. ~600 ≈ 10 s of moving frames.
+    static preloadedTileTTLUpdates: number = 600;
 
     constructor(id: string, options: SourceSpecification | CanvasSourceSpecification, dispatcher: Dispatcher) {
         super();
@@ -567,6 +573,23 @@ export class TileManager extends Evented {
         } else {
             this._cleanUpVectorTiles(retain);
         }
+
+        // PATCH (map2-fork): TTL sweep — auto-release pinned preloads that were never promoted
+        // (the camera never arrived and the caller never released). Bounded-leak backstop.
+        this._updateCount++;
+        let ttlExpired = 0;
+        for (const key in this._preloadedTiles) {
+            if (this._preloadedTiles[key].staleAfterUpdate < this._updateCount) {
+                this._unpinTile(this._preloadedTiles[key].tile);
+                delete this._preloadedTiles[key];
+                ttlExpired++;
+            }
+        }
+        if (ttlExpired > 0) {
+            // Deliberately loud: in a well-behaved animation every pin is promoted or explicitly
+            // released, so this firing means preloads are being wasted (or a release is missing).
+            console.log(`[map2-fork] preload TTL: auto-released ${ttlExpired} never-promoted tile(s) on source '${this.id}'`);
+        }
     }
 
     // PATCH (map2-fork): load (fetch + worker-parse) the tiles covering a FUTURE transform, ahead
@@ -598,7 +621,13 @@ export class TileManager extends Evented {
 
         const loads: Promise<void>[] = [];
         for (const tileID of idealTileIDs) {
-            if (this._inViewTiles.getTileById(tileID.key) || this._preloadedTiles[tileID.key]) {
+            if (this._inViewTiles.getTileById(tileID.key)) {
+                continue;
+            }
+            const pinned = this._preloadedTiles[tileID.key];
+            if (pinned) {
+                // re-preloading signals renewed interest — refresh the pin's TTL
+                pinned.staleAfterUpdate = this._updateCount + TileManager.preloadedTileTTLUpdates;
                 continue;
             }
             let tile = this._outOfViewCache.getAndRemove(tileID);
@@ -607,18 +636,32 @@ export class TileManager extends Evented {
                 this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
                 loads.push(this._loadTile(tile, tileID.key, tile.state));
             }
-            this._preloadedTiles[tileID.key] = tile;
+            this._preloadedTiles[tileID.key] = {tile, staleAfterUpdate: this._updateCount + TileManager.preloadedTileTTLUpdates};
         }
         await Promise.allSettled(loads);
     }
 
     // PATCH (map2-fork): take a pinned preloaded tile, if present, for promotion to in-view.
     private _takePreloadedTile(tileID: OverscaledTileID): Tile | undefined {
-        const tile = this._preloadedTiles[tileID.key];
-        if (tile) {
+        const entry = this._preloadedTiles[tileID.key];
+        if (entry) {
             delete this._preloadedTiles[tileID.key];
+            return entry.tile;
         }
-        return tile;
+        return undefined;
+    }
+
+    // PATCH (map2-fork): unpin one tile — still-valid data goes to the LRU (reusable, evictable),
+    // anything not fully loaded is aborted and unloaded. Shared by releasePreloadedTiles and the
+    // TTL sweep in update().
+    private _unpinTile(tile: Tile) {
+        if (tile.hasData() && tile.state !== 'reloading') {
+            this._outOfViewCache.add(tile.tileID, tile, tile.getExpiryTimeout());
+        } else {
+            tile.aborted = true;
+            this._abortTile(tile);
+            this._unloadTile(tile);
+        }
     }
 
     // PATCH (map2-fork): unpin all preloaded tiles that were never promoted — loaded ones join the
@@ -626,14 +669,7 @@ export class TileManager extends Evented {
     // The app calls this (via Map#releasePreloadedTiles) when its animation step/sequence ends.
     releasePreloadedTiles() {
         for (const key in this._preloadedTiles) {
-            const tile = this._preloadedTiles[key];
-            if (tile.hasData() && tile.state !== 'reloading') {
-                this._outOfViewCache.add(tile.tileID, tile, tile.getExpiryTimeout());
-            } else {
-                tile.aborted = true;
-                this._abortTile(tile);
-                this._unloadTile(tile);
-            }
+            this._unpinTile(this._preloadedTiles[key].tile);
         }
         this._preloadedTiles = {};
     }
@@ -919,7 +955,7 @@ export class TileManager extends Evented {
     // and loaded pins are worth keeping in the LRU.
     private _disposePreloadedTiles() {
         for (const key in this._preloadedTiles) {
-            const tile = this._preloadedTiles[key];
+            const {tile} = this._preloadedTiles[key];
             tile.aborted = true;
             this._abortTile(tile);
             this._unloadTile(tile);
