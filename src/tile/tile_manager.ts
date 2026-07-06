@@ -76,6 +76,11 @@ export class TileManager extends Evented {
     _inViewTiles: InViewTiles;
     _prevLng: number;
     _outOfViewCache: TileCache;
+    // PATCH (map2-fork): tiles loaded ahead of need for a known FUTURE camera (see preloadTiles).
+    // Held outside _outOfViewCache so the current viewport's LRU pressure cannot evict them before
+    // the camera arrives. _addTile promotes them into the in-view set; releasePreloadedTiles hands
+    // any leftovers back to the LRU.
+    _preloadedTiles: Record<string, Tile> = {};
     _timers: Record<string, ReturnType<typeof setTimeout>>;
     _maxTileCacheSize: number;
     _maxTileCacheZoomLevels: number;
@@ -265,6 +270,12 @@ export class TileManager extends Evented {
             this._shouldReloadOnResume = true;
             return;
         }
+
+        // PATCH (map2-fork): the source's data changed, so pinned preloads are stale — a promoted
+        // stale tile would render the OLD data (e.g. a GeoJSON overlay that setData()s every
+        // animation frame: the previous track's ride vanished from preloaded viewports). Drop them;
+        // the arrival will load fresh. Sources that never reload keep their pins untouched.
+        this._disposePreloadedTiles();
 
         this._outOfViewCache.reset();
 
@@ -558,6 +569,75 @@ export class TileManager extends Evented {
         }
     }
 
+    // PATCH (map2-fork): load (fetch + worker-parse) the tiles covering a FUTURE transform, ahead
+    // of the camera arriving there. For a scripted, deterministic animation the app knows every
+    // future viewport, so it can prepay the expensive download+decode here; when update() later
+    // needs these tiles, _addTile promotes them from _preloadedTiles at zero cost (only the GPU
+    // upload remains, on first render). Resolves when every newly requested tile settles
+    // (loaded or errored). Tiles already in view, already pinned, or already cached are reused.
+    // Not supported for image sources or terrain-ancestor expansion (unused by our exports).
+    async preloadTiles(transform: ITransform): Promise<void> {
+        if (!this._sourceLoaded || this._paused) return;
+        if (!this.used && !this.usedForTerrain) return;
+        if (this._source.tileID) return;   // image source: nothing tiled to preload
+
+        let idealTileIDs = coveringTiles(transform, {
+            tileSize: this.usedForTerrain ? this.tileSize : this._source.tileSize,
+            minzoom: this._source.minzoom,
+            maxzoom: this._source.type === 'vector' && this.map._zoomLevelsToOverscale !== undefined
+                ? transform.maxZoom - this.map._zoomLevelsToOverscale
+                : this._source.maxzoom,
+            roundZoom: this.usedForTerrain ? false : this._source.roundZoom,
+            reparseOverscaled: this._source.reparseOverscaled,
+            terrain: this.terrain,
+            calculateTileZoom: this._source.calculateTileZoom,
+        });
+        if (this._source.hasTile) {
+            idealTileIDs = idealTileIDs.filter((coord) => this._source.hasTile(coord));
+        }
+
+        const loads: Promise<void>[] = [];
+        for (const tileID of idealTileIDs) {
+            if (this._inViewTiles.getTileById(tileID.key) || this._preloadedTiles[tileID.key]) {
+                continue;
+            }
+            let tile = this._outOfViewCache.getAndRemove(tileID);
+            if (!tile) {
+                tile = new Tile(tileID, this._source.tileSize * tileID.overscaleFactor());
+                this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
+                loads.push(this._loadTile(tile, tileID.key, tile.state));
+            }
+            this._preloadedTiles[tileID.key] = tile;
+        }
+        await Promise.allSettled(loads);
+    }
+
+    // PATCH (map2-fork): take a pinned preloaded tile, if present, for promotion to in-view.
+    private _takePreloadedTile(tileID: OverscaledTileID): Tile | undefined {
+        const tile = this._preloadedTiles[tileID.key];
+        if (tile) {
+            delete this._preloadedTiles[tileID.key];
+        }
+        return tile;
+    }
+
+    // PATCH (map2-fork): unpin all preloaded tiles that were never promoted — loaded ones join the
+    // regular LRU (still reusable, now evictable), in-flight/errored ones are aborted and unloaded.
+    // The app calls this (via Map#releasePreloadedTiles) when its animation step/sequence ends.
+    releasePreloadedTiles() {
+        for (const key in this._preloadedTiles) {
+            const tile = this._preloadedTiles[key];
+            if (tile.hasData() && tile.state !== 'reloading') {
+                this._outOfViewCache.add(tile.tileID, tile, tile.getExpiryTimeout());
+            } else {
+                tile.aborted = true;
+                this._abortTile(tile);
+                this._unloadTile(tile);
+            }
+        }
+        this._preloadedTiles = {};
+    }
+
     /**
      * Remove raster tiles that are no longer retained
      */
@@ -689,7 +769,8 @@ export class TileManager extends Evented {
         if (tile)
             return tile;
 
-        tile = this._outOfViewCache.getAndRemove(tileID);
+        // PATCH (map2-fork): promote a preloaded (pinned) tile before consulting the LRU cache.
+        tile = this._takePreloadedTile(tileID) ?? this._outOfViewCache.getAndRemove(tileID);
         if (tile) {
             //reset fading logic to remove stale fading data from cache
             tile.resetFadeLogic();
@@ -827,7 +908,23 @@ export class TileManager extends Evented {
             this._removeTile(id);
         }
 
+        // PATCH (map2-fork): pinned preloads are stale too on a source clear — abort and unload.
+        this._disposePreloadedTiles();
+
         this._outOfViewCache.reset();
+    }
+
+    // PATCH (map2-fork): abort and unload every pinned preload (they are invalid — the source's
+    // data changed or was cleared). Contrast releasePreloadedTiles, where the data is still valid
+    // and loaded pins are worth keeping in the LRU.
+    private _disposePreloadedTiles() {
+        for (const key in this._preloadedTiles) {
+            const tile = this._preloadedTiles[key];
+            tile.aborted = true;
+            this._abortTile(tile);
+            this._unloadTile(tile);
+        }
+        this._preloadedTiles = {};
     }
 
     /**
