@@ -21,6 +21,11 @@ export const TRANSITION_SUFFIX = '-transition';
 export type CrossFaded<T> = {
     to: T;
     from: T;
+    // The images either side of `mid`, kept so a tile's atlas can host every pattern a zoom
+    // crossing can ask for. Without them, zooming IN reaches for the next mip before any tile
+    // carries it, and the missing-position fallback in updatePatternPositionsInProgram renders
+    // the outgoing image at both scales — a visible "2x flash" at each integer zoom.
+    neighbors?: [T, T];
 };
 
 /**
@@ -583,11 +588,11 @@ export class CrossFadedDataDrivenProperty<T> extends DataDrivenProperty<CrossFad
             const constant = this._calculate(constantValue, constantValue, constantValue, parameters);
             return new PossiblyEvaluatedPropertyValue(this, {kind: 'constant', value: constant}, parameters);
         } else if (value.expression.kind === 'camera') {
-            const cameraVal = this._calculate(
-                value.expression.evaluate({zoom: parameters.zoom - 1.0}),
-                value.expression.evaluate({zoom: parameters.zoom}),
-                value.expression.evaluate({zoom: parameters.zoom + 1.0}),
-                parameters);
+            const min = value.expression.evaluate({zoom: parameters.zoom - 1.0});
+            const mid = value.expression.evaluate({zoom: parameters.zoom});
+            const max = value.expression.evaluate({zoom: parameters.zoom + 1.0});
+            const cameraVal = this._calculate(min, mid, max, parameters);
+            cameraVal.neighbors = [min, max];
             return new PossiblyEvaluatedPropertyValue(this, {kind: 'constant', value: cameraVal}, parameters);
         } else {
             // source or composite expression
@@ -650,11 +655,12 @@ export class CrossFadedProperty<T> implements Property<T, CrossFaded<T>> {
             const constant = value.expression.evaluate(parameters, null, {}, canonical, availableImages);
             return this._calculate(constant, constant, constant, parameters);
         } else {
-            return this._calculate(
-                value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom - 1.0), parameters)),
-                value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom), parameters)),
-                value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom + 1.0), parameters)),
-                parameters);
+            const min = value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom - 1.0), parameters));
+            const mid = value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom), parameters));
+            const max = value.expression.evaluate(new EvaluationParameters(Math.floor(parameters.zoom + 1.0), parameters));
+            const result = this._calculate(min, mid, max, parameters);
+            result.neighbors = [min, max];
+            return result;
         }
     }
 

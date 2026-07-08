@@ -25,6 +25,12 @@ export function hasPattern(type: string, layers: PatternStyleLayers, options: Po
             hasPattern = true;
             patterns[constantPattern.to] =  true;
             patterns[constantPattern.from] =  true;
+            // zoom-dependent constant patterns (a ["step",["zoom"],…] mip ladder): host the
+            // adjacent zooms' images too, so a zoom crossing never asks this tile's atlas for
+            // an image it doesn't hold (the fallback renders a wrong-scale pattern — a flash).
+            for (const neighbor of constantPattern.neighbors ?? []) {
+                patterns[neighbor] = true;
+            }
         }
     }
 
