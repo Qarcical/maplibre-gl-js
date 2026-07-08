@@ -2339,7 +2339,11 @@ export class Map extends Camera {
             this.painter.renderToTexture = null;
             this.transform.setMinElevationForCurrentTile(0);
             if (this._centerClampedToGround) {
-                this.transform.setElevation(0);
+                // Re-reference to elevation 0 while holding the camera physically stationary
+                // (adjusts zoom/center together). A raw setElevation(0) here keeps zoom fixed
+                // and teleports the camera down by the old centre elevation — a visible snap
+                // when disabling terrain over high ground.
+                this.transform.recalculateZoomAndCenter();
             }
         } else {
             // add terrain
@@ -2360,7 +2364,17 @@ export class Map extends Camera {
             this.terrain = new Terrain(this.painter, tileManager, options);
             this.painter.renderToTexture = new RenderToTexture(this.painter, this.terrain);
             this.transform.setMinElevationForCurrentTile(this.terrain.getMinTileElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
-            this.transform.setElevation(this.terrain.getElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
+            if (this._centerClampedToGround) {
+                // Hold the camera stationary while the centre's ground elevation appears
+                // (see the removal path above for the raw-setElevation snap this avoids).
+                // Sample at transform.center directly — recalculateZoomAndCenter(terrain)
+                // unprojects the screen centre through the terrain coords framebuffer, which
+                // hasn't rendered yet at install time and returns garbage (observed as a
+                // 133 km elevation teleport).
+                this.transform.recalculateZoomAndCenterForElevation(this.terrain.getElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
+            } else {
+                this.transform.setElevation(this.terrain.getElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
+            }
             this._terrainDataCallback = e => {
                 if (e.dataType === 'style') {
                     this.terrain.tileManager.freeRtt();
@@ -2368,7 +2382,18 @@ export class Map extends Camera {
                     if (e.sourceId === options.source && !this._elevationFreeze) {
                         this.transform.setMinElevationForCurrentTile(this.terrain.getMinTileElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
                         if (this._centerClampedToGround) {
-                            this.transform.setElevation(this.terrain.getElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
+                            // DEM tiles decode AFTER the install-time reload(), so the centre's
+                            // elevation arrives asynchronously — as a step, not a glide. A raw
+                            // setElevation here lifts the camera by the full centre elevation in
+                            // one frame (the "gained 1000 feet" pop, sized by whatever hill is
+                            // under the camera). Re-reference with the camera held stationary,
+                            // sampling at transform.center directly — the terrain-unprojecting
+                            // recalculateZoomAndCenter reads the coords framebuffer, which may
+                            // not have rendered yet this early after install (garbage teleport).
+                            // The per-frame tracking in _render stays raw setElevation, which is
+                            // correct for continuous centre movement and sees no step because
+                            // this callback has already absorbed it.
+                            this.transform.recalculateZoomAndCenterForElevation(this.terrain.getElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
                         }
                     }
 

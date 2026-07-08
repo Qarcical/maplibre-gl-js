@@ -538,6 +538,11 @@ export class VerticalPerspectiveTransform implements ITransform {
         this._helper.recalculateZoomAndCenter(0);
     }
 
+    recalculateZoomAndCenterForElevation(_elevation: number): void {
+        // terrain is not supported on vertical perspective projection (see above)
+        this._helper.recalculateZoomAndCenter(0);
+    }
+
     maxPitchScaleFactor(): number {
         // In mercaltor it uses the pixelMatrix, but this is not available here...
         return 1;

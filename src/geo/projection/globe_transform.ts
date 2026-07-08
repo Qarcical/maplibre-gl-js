@@ -369,6 +369,11 @@ export class GlobeTransform implements ITransform {
         this._verticalPerspectiveTransform.recalculateZoomAndCenter(terrain);
     }
 
+    recalculateZoomAndCenterForElevation(elevation: number): void {
+        this._mercatorTransform.recalculateZoomAndCenterForElevation(elevation);
+        this._verticalPerspectiveTransform.recalculateZoomAndCenterForElevation(elevation);
+    }
+
     maxPitchScaleFactor(): number {
         // Using mercator version of this should be good enough approximation for globe.
         return this._mercatorTransform.maxPitchScaleFactor();

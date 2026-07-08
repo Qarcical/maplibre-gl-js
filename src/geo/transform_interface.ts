@@ -201,6 +201,17 @@ interface ITransformMutators {
     recalculateZoomAndCenter(terrain?: Terrain): void;
 
     /**
+     * Re-references zoom and center for the given centre-ground elevation while holding the
+     * camera physically stationary. Unlike {@link recalculateZoomAndCenter} this takes the
+     * elevation directly and never unprojects the screen centre through the terrain, so it
+     * is safe to call before the terrain has rendered its coords framebuffer (setTerrain
+     * install, DEM data callbacks) — unprojecting there returns garbage locations and the
+     * camera teleports.
+     * @param elevation - the centre-ground elevation in meters
+     */
+    recalculateZoomAndCenterForElevation(elevation: number): void;
+
+    /**
      * Set's the transform's center so that the given point on screen is at the given world coordinates.
      * @param lnglat - Desired world coordinates of the point.
      * @param point - The screen point that should lie at the given coordinates.
