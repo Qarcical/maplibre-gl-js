@@ -95,6 +95,10 @@ export class Tile {
     showCollisionBoxes: boolean;
     placementSource: any;
     actor: Actor;
+    // PATCH (map2-fork): set by TileManager.preloadTiles — this tile's worker parse is sent at
+    // low priority so a prefetch burst yields to interactive work (per-frame GeoJSON setData).
+    // Cleared on promotion to in-view / unpinning, so any later reload is normal priority.
+    isPreload?: boolean;
     vtLayers: {[_: string]: VectorTileLayerLike};
 
     neighboringTiles: Record<string, {backfilled: boolean}>;

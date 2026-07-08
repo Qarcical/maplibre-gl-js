@@ -164,5 +164,9 @@ export type ActorMessage<T extends MessageType> = {
     data: RequestResponseMessageMap[T][0];
     targetMapId?: string | number | null;
     mustQueue?: boolean;
+    // PATCH (map2-fork): 'low' routes the task to the receiving actor's low-priority queue —
+    // it runs only when no normal-priority task is waiting. Used for preloaded-tile parses so
+    // a burst of prefetch work cannot delay interactive tasks (per-frame GeoJSON setData).
+    priority?: 'low';
     sourceMapId?: string | number | null;
 };

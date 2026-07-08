@@ -606,7 +606,8 @@ export class GeoJSONSource extends Evented implements Source {
         };
 
         tile.abortController = new AbortController();
-        const data = await this.actor.sendAsync({type: message, data: params}, tile.abortController);
+        const data = await this.actor.sendAsync(
+            {type: message, data: params, priority: tile.isPreload ? 'low' : undefined}, tile.abortController);
         delete tile.abortController;
         tile.unloadVectorData();
 

@@ -647,6 +647,7 @@ export class TileManager extends Evented {
             }
             if (!tile) {
                 tile = new Tile(tileID, this._source.tileSize * tileID.overscaleFactor());
+                tile.isPreload = true;   // parse at low priority — yield to interactive worker tasks
                 this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
                 loads.push(this._loadTile(tile, tileID.key, tile.state));
             }
@@ -663,6 +664,7 @@ export class TileManager extends Evented {
         const entry = this._preloadedTiles[tileID.key];
         if (entry) {
             delete this._preloadedTiles[tileID.key];
+            entry.tile.isPreload = false;   // in view now — any later reload is interactive
             return entry.tile;
         }
         return undefined;
@@ -672,6 +674,7 @@ export class TileManager extends Evented {
     // anything not fully loaded is aborted and unloaded. Shared by releasePreloadedTiles and the
     // TTL sweep in update().
     private _unpinTile(tile: Tile) {
+        tile.isPreload = false;   // rejoining the normal tile population
         if (tile.hasData() && tile.state !== 'reloading') {
             this._outOfViewCache.add(tile.tileID, tile, tile.getExpiryTimeout());
         } else {

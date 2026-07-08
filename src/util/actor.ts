@@ -28,6 +28,8 @@ type MessageData = {
     data?: Serialized;
     targetMapId?: string | number | null;
     mustQueue?: boolean;
+    // PATCH (map2-fork): see ActorMessage.priority — low-priority tasks yield to normal ones.
+    priority?: 'low';
     error?: Serialized | null;
     sourceMapId: string | number | null;
 };
@@ -61,6 +63,9 @@ export class Actor implements IActor {
     name: string;
     tasks: { [x: string]: MessageData };
     taskQueue: string[];
+    // PATCH (map2-fork): tasks tagged priority:'low' (preloaded-tile parses) wait here and run
+    // only when taskQueue is empty, so prefetch bursts can't sit in front of interactive work.
+    lowPriorityTaskQueue: string[];
     abortControllers: { [x: number | string]: AbortController };
     invoker: ThrottledInvoker;
     globalScope: ActorTarget;
@@ -77,6 +82,7 @@ export class Actor implements IActor {
         this.resolveRejects = {};
         this.tasks = {};
         this.taskQueue = [];
+        this.lowPriorityTaskQueue = [];
         this.abortControllers = {};
         this.messageHandlers = {};
         this.invoker = new ThrottledInvoker(() => this.process());
@@ -181,7 +187,7 @@ export class Actor implements IActor {
             // messages can be processed. We're using a MessageChannel object to get throttle the
             // process() flow to one at a time.
             this.tasks[id] = data;
-            this.taskQueue.push(id);
+            (data.priority === 'low' ? this.lowPriorityTaskQueue : this.taskQueue).push(id);
             this.invoker.trigger();
             return;
         }
@@ -191,16 +197,18 @@ export class Actor implements IActor {
     }
 
     process() {
-        if (this.taskQueue.length === 0) {
+        // PATCH (map2-fork): drain normal-priority tasks first; the low-priority queue
+        // (preloaded-tile parses) only advances when nothing interactive is waiting.
+        if (this.taskQueue.length === 0 && this.lowPriorityTaskQueue.length === 0) {
             return;
         }
-        const id = this.taskQueue.shift();
+        const id = this.taskQueue.length > 0 ? this.taskQueue.shift() : this.lowPriorityTaskQueue.shift();
         const task = this.tasks[id];
         delete this.tasks[id];
         // Schedule another process call if we know there's more to process _before_ invoking the
         // current task. This is necessary so that processing continues even if the current task
         // doesn't execute successfully.
-        if (this.taskQueue.length > 0) {
+        if (this.taskQueue.length > 0 || this.lowPriorityTaskQueue.length > 0) {
             this.invoker.trigger();
         }
         if (!task) {

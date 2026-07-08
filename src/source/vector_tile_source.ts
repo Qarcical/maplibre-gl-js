@@ -231,7 +231,8 @@ export class VectorTileSource extends Evented implements Source {
         }
         tile.abortController = new AbortController();
         try {
-            const data = await tile.actor.sendAsync({type: messageType, data: params}, tile.abortController);
+            const data = await tile.actor.sendAsync(
+                {type: messageType, data: params, priority: tile.isPreload ? 'low' : undefined}, tile.abortController);
             delete tile.abortController;
 
             if (tile.aborted) {

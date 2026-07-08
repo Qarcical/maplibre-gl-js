@@ -90,7 +90,8 @@ export class RasterDEMTileSource extends RasterTileSource implements Source {
                 if (!tile.actor || tile.state === 'expired') {
                     tile.actor = this.dispatcher.getActor();
                 }
-                tile.dem = await tile.actor.sendAsync({type: MessageType.loadDEMTile, data: params});
+                tile.dem = await tile.actor.sendAsync(
+                    {type: MessageType.loadDEMTile, data: params, priority: tile.isPreload ? 'low' : undefined});
                 tile.needsHillshadePrepare = true;
                 tile.needsTerrainPrepare = true;
                 tile.state = 'loaded';
