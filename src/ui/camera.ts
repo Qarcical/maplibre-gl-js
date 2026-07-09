@@ -337,6 +337,9 @@ export abstract class Camera extends Evented {
      * Saves the current state of the elevation freeze - this is used during map movement to prevent "rocky" camera movement.
      */
     _elevationFreeze: boolean;
+    // PATCH (map2-fork): true while an ease glides toward an explicitly-supplied target
+    // elevation — per-frame DEM retargeting is suspended (see _prepareElevation).
+    _elevationLocked: boolean;
     /**
      * @internal
      * Used to track accumulated changes during continuous interaction
@@ -1214,18 +1217,27 @@ export abstract class Camera extends Evented {
         this._prepareEase(eventData, options.noMoveStart, currently);
 
         if (this.terrain) {
-            this._prepareElevation(easeHandler.elevationCenter);
+            this._prepareElevation(easeHandler.elevationCenter, options.elevation);
         }
 
         this._ease((k) => {
             easeHandler.easeFunc(k);
 
-            if (this.terrain && !options.freezeElevation) this._updateElevation(k);
+            if (this.terrain && !options.freezeElevation) this._updateElevation(k, tr);
             this._applyUpdatedTransform(tr);
             this._fireMoveEvents(eventData);
 
         }, (interruptingEaseId?: string) => {
-            if (this.terrain && options.freezeElevation) this._finalizeElevation();
+            if (this.terrain) {
+                if (options.freezeElevation) this._finalizeElevation();
+                // PATCH (map2-fork): without freezeElevation the freeze flag used to dangle
+                // true forever (only _finalizeElevation and gesture-end reset it), gating the
+                // per-frame and DEM-arrival elevation updates until the next gesture. A LOCKED
+                // glide (explicit options.elevation) stays frozen, though: its target is the
+                // caller's number, which may disagree with the DEM by ~10 m — clearing here
+                // let the next render raw-snap that residual. The caller reconciles.
+                else if (!this._elevationLocked) this._elevationFreeze = false;
+            }
             this._afterEase(eventData, interruptingEaseId);
         }, options as any);
 
@@ -1252,29 +1264,49 @@ export abstract class Camera extends Evented {
         }
     }
 
-    _prepareElevation(center: LngLat) {
+    // PATCH (map2-fork): an ease may carry an explicit target elevation (CameraOptions.elevation,
+    // honoured by jumpTo upstream but ignored by eases). Without it, the glide samples the DEM at
+    // the destination per frame — but mid-flight the destination's fine tiles aren't loaded, so
+    // getSourceTile falls back to a coarse parent texel and the glide "lands" hundreds of metres
+    // wrong; the first camera write after arrival then teleports the camera by the difference.
+    // A caller that knows the destination's true ground elevation can pin the glide to it.
+    _prepareElevation(center: LngLat, targetElevation?: number) {
         this._elevationCenter = center;
         this._elevationStart = this.transform.elevation;
-        this._elevationTarget = this.terrain.getElevationForLngLatZoom(center, this.transform.tileZoom);
+        if (targetElevation != null) {
+            this._elevationTarget = targetElevation;
+            this._elevationLocked = true;
+        } else {
+            this._elevationTarget = this.terrain.getElevationForLngLatZoom(center, this.transform.tileZoom);
+            this._elevationLocked = false;
+        }
         this._elevationFreeze = true;
     }
 
-    _updateElevation(k: number) {
+    // PATCH (map2-fork): _updateElevation must write to the ease's UPDATE transform, not
+    // this.transform. With terrain enabled, eases operate on the _requestedCameraState clone
+    // and _applyUpdatedTransform() overwrites the real transform from that clone every frame
+    // — so an elevation written to this.transform was clobbered a moment later and the glide
+    // was a silent no-op in every terrain ease (the camera then teleported when something
+    // finally re-sampled elevation for real). Pass the ease's transform in.
+    _updateElevation(k: number, tr: ITransform = this.transform) {
 
         if (this._elevationStart === undefined || this._elevationCenter === undefined) {
-            this._prepareElevation(this.transform.center);
+            this._prepareElevation(tr.center);
         }
 
-        this.transform.setMinElevationForCurrentTile(this.terrain.getMinTileElevationForLngLatZoom(this._elevationCenter, this.transform.tileZoom));
-        const elevation = this.terrain.getElevationForLngLatZoom(this._elevationCenter, this.transform.tileZoom);
-        // target terrain updated during flight, slowly move camera to new height
-        if (k < 1 && elevation !== this._elevationTarget) {
-            const pitch1 = this._elevationTarget - this._elevationStart;
-            const pitch2 = (elevation - (pitch1 * k + this._elevationStart)) / (1 - k);
-            this._elevationStart += k * (pitch1 - pitch2);
-            this._elevationTarget = elevation;
+        tr.setMinElevationForCurrentTile(this.terrain.getMinTileElevationForLngLatZoom(this._elevationCenter, tr.tileZoom));
+        if (!this._elevationLocked) {
+            const elevation = this.terrain.getElevationForLngLatZoom(this._elevationCenter, tr.tileZoom);
+            // target terrain updated during flight, slowly move camera to new height
+            if (k < 1 && elevation !== this._elevationTarget) {
+                const pitch1 = this._elevationTarget - this._elevationStart;
+                const pitch2 = (elevation - (pitch1 * k + this._elevationStart)) / (1 - k);
+                this._elevationStart += k * (pitch1 - pitch2);
+                this._elevationTarget = elevation;
+            }
         }
-        this.transform.setElevation(interpolates.number(this._elevationStart, this._elevationTarget, k));
+        tr.setElevation(interpolates.number(this._elevationStart, this._elevationTarget, k));
     }
 
     _finalizeElevation() {
@@ -1510,7 +1542,7 @@ export abstract class Camera extends Evented {
         this._padding = !tr.isPaddingEqual(padding);
 
         this._prepareEase(eventData, false);
-        if (this.terrain) this._prepareElevation(flyToHandler.targetCenter);
+        if (this.terrain) this._prepareElevation(flyToHandler.targetCenter, options.elevation);
 
         this._ease((k) => {
             // s: The distance traveled along the flight path, measured in ρ-screenfulls.
@@ -1535,11 +1567,16 @@ export abstract class Camera extends Evented {
 
             flyToHandler.easeFunc(k, scale, centerFactor, pointAtOffset);
 
-            if (this.terrain && !options.freezeElevation) this._updateElevation(k);
+            if (this.terrain && !options.freezeElevation) this._updateElevation(k, tr);
             this._applyUpdatedTransform(tr);
             this._fireMoveEvents(eventData);
         }, () => {
-            if (this.terrain && options.freezeElevation) this._finalizeElevation();
+            if (this.terrain) {
+                if (options.freezeElevation) this._finalizeElevation();
+                // PATCH (map2-fork): see easeTo — don't leave the elevation freeze dangling
+                // (but a locked glide stays frozen; the caller reconciles the DEM residual).
+                else if (!this._elevationLocked) this._elevationFreeze = false;
+            }
             this._afterEase(eventData);
         }, options);
 

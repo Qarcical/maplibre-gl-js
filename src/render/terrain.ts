@@ -530,12 +530,18 @@ export class Terrain {
     }
 
     _getOverscaledTileIDFromLngLatZoom(lnglat: LngLat, zoom: number): { tileID: OverscaledTileID; mercatorX: number; mercatorY: number} {
+        // Callers pass display zooms, which may be FRACTIONAL (e.g. jumpTo({zoom: 14.5})
+        // feeds options.zoom into the terrain elevation lookup). A fractional z in the tile
+        // ID can never match a cache key, so the lookup silently missed and elevation read
+        // as 0 — with centerClampedToGround that teleported the camera to sea level on the
+        // first jumpTo after a fly-in. Tile space is integer: floor first.
+        const tileZoom = Math.floor(zoom);
         const mercatorCoordinate = MercatorCoordinate.fromLngLat(lnglat.wrap());
-        const worldSize = (1 << zoom) * EXTENT;
+        const worldSize = (1 << tileZoom) * EXTENT;
         const mercatorX = mercatorCoordinate.x * worldSize;
         const mercatorY = mercatorCoordinate.y * worldSize;
         const tileX = Math.floor(mercatorX / EXTENT), tileY = Math.floor(mercatorY / EXTENT);
-        const tileID = new OverscaledTileID(zoom, 0, zoom, tileX, tileY);
+        const tileID = new OverscaledTileID(tileZoom, 0, tileZoom, tileX, tileY);
         return {
             tileID,
             mercatorX,
