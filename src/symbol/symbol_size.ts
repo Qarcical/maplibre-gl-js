@@ -23,6 +23,13 @@ export type SizeData = {
     minSize: number;
     maxSize: number;
     interpolationType: InterpolationType;
+    // map2-fork: the full stop curve. min/max above only bracket [tileZoom, tileZoom+1];
+    // when a tile is rendered far from its layout zoom (fast zoom-out, re-layout pending)
+    // the painter would clamp to that bracket and draw wildly oversized/undersized symbols
+    // until idle. Camera (zoom-only) sizes have no per-feature data limitation, so we ship
+    // every stop and interpolate across the whole curve at render time.
+    stopZooms?: Array<number>;
+    stopSizes?: Array<number>;
 } | {
     kind: 'composite';
     minZoom: number;
@@ -73,7 +80,12 @@ function getSizeData(
         const minSize = expression.evaluate(new EvaluationParameters(minZoom));
         const maxSize = expression.evaluate(new EvaluationParameters(maxZoom));
 
-        return {kind: 'camera', minZoom, maxZoom, minSize, maxSize, interpolationType};
+        // map2-fork: evaluate the whole curve so rendering isn't clamped to the tile's
+        // covering bracket while a re-layout is pending (see SizeData comment).
+        const stopZooms = zoomStops.slice();
+        const stopSizes = stopZooms.map(z => expression.evaluate(new EvaluationParameters(z)));
+
+        return {kind: 'camera', minZoom, maxZoom, minSize, maxSize, interpolationType, stopZooms, stopSizes};
     }
 }
 
@@ -119,7 +131,20 @@ function evaluateSizeForZoom(sizeData: SizeData, zoom: number): EvaluatedZoomSiz
             Interpolate.interpolationFactor(interpolationType, zoom, minZoom, maxZoom), 0, 1);
 
         if (sizeData.kind === 'camera') {
-            uSize = interpolates.number(sizeData.minSize, sizeData.maxSize, t);
+            const {stopZooms, stopSizes} = sizeData;
+            if (stopZooms && stopSizes && stopZooms.length > 1 && interpolationType) {
+                // map2-fork: interpolate across the full stop curve instead of clamping to
+                // the tile's covering bracket — a tile displayed far from its layout zoom
+                // otherwise renders symbols at the bracket edge until re-layout on idle.
+                let hi = 1;
+                while (hi < stopZooms.length - 1 && stopZooms[hi] < zoom) hi++;
+                const lo = hi - 1;
+                const tt = clamp(Interpolate.interpolationFactor(
+                    interpolationType, zoom, stopZooms[lo], stopZooms[hi]), 0, 1);
+                uSize = interpolates.number(stopSizes[lo], stopSizes[hi], tt);
+            } else {
+                uSize = interpolates.number(sizeData.minSize, sizeData.maxSize, t);
+            }
         } else {
             uSizeT = t;
         }
