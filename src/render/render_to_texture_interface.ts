@@ -13,5 +13,6 @@ export interface IRenderToTexture {
     renderLayer(layer: StyleLayer, renderOptions: RenderOptions): boolean;
     getTexture(tile: Tile): any;
     markSourceTileChanged(sourceId: string, tileID: OverscaledTileID): void;
+    markSourceChanged(sourceId: string): void;
     destruct(): void;
 }

@@ -573,7 +573,7 @@ export class LineBucket implements Bucket {
             const progressRealigned = this.scaledDistance - this.lineClips.start;
             const endClipRealigned = this.lineClips.end - this.lineClips.start;
             const uvX = progressRealigned / endClipRealigned;
-            this.layoutVertexArray2.emplaceBack(uvX, this.lineClipsArray.length);
+            this.layoutVertexArray2.emplaceBack(uvX, this.lineClipsArray.length, this.scaledDistance);
         }
 
         const e = segment.vertexLength++;

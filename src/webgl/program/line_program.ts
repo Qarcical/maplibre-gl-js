@@ -24,6 +24,7 @@ export type LineGradientUniformsType = {
     'u_units_to_pixels': Uniform2f;
     'u_image': Uniform1i;
     'u_image_height': Uniform1f;
+    'u_progress_clip': Uniform1f;
 };
 
 export type LinePatternUniformsType = {
@@ -80,7 +81,8 @@ const lineGradientUniforms = (context: Context, locations: UniformLocations): Li
     'u_device_pixel_ratio': new Uniform1f(context, locations.u_device_pixel_ratio),
     'u_units_to_pixels': new Uniform2f(context, locations.u_units_to_pixels),
     'u_image': new Uniform1i(context, locations.u_image),
-    'u_image_height': new Uniform1f(context, locations.u_image_height)
+    'u_image_height': new Uniform1f(context, locations.u_image_height),
+    'u_progress_clip': new Uniform1f(context, locations.u_progress_clip)
 });
 
 const linePatternUniforms = (context: Context, locations: UniformLocations): LinePatternUniformsType => ({
@@ -153,6 +155,9 @@ const lineGradientUniformValues = (
     return extend(lineUniformValues(painter, tile, layer, ratioScale), {
         'u_image': 0,
         'u_image_height': imageHeight,
+        // clip rendering to the leading fraction of each feature (2 = disabled) —
+        // see Map.setLineProgressClip
+        'u_progress_clip': layer.lineProgressClip ?? 2,
     });
 };
 

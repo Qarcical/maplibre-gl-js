@@ -41,6 +41,12 @@ export class LineStyleLayer extends StyleLayer {
 
     gradientVersion: number;
     stepInterpolant: boolean;
+    /**
+     * render only the leading fraction (0..1) of each feature's length; null = whole
+     * line. Animated per frame via Map.setLineProgressClip — requires the layer to
+     * use `line-gradient` (that program variant carries per-vertex line progress).
+     */
+    lineProgressClip: number | null = null;
 
     _transitionablePaint: Transitionable<LinePaintProps>;
     _transitioningPaint: Transitioning<LinePaintProps>;

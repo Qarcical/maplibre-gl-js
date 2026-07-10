@@ -10,6 +10,9 @@ in vec2 a_pos_normal;
 in vec4 a_data;
 in float a_uv_x;
 in float a_split_index;
+// NOTE: no precision qualifier — the static-attribute extractor in shaders.ts
+// parses `in <type> <name>` and a qualifier would break the location binding
+in float a_global_progress;
 
 uniform vec2 u_translation;
 uniform mediump float u_ratio;
@@ -21,6 +24,7 @@ out vec2 v_normal;
 out vec2 v_width2;
 out float v_gamma_scale;
 out highp vec2 v_uv;
+out highp float v_global_progress;
 #ifdef GLOBE
 out float v_depth;
 #endif
@@ -48,6 +52,7 @@ void main() {
     highp float texel_height = 1.0 / u_image_height;
     highp float half_texel_height = 0.5 * texel_height;
     v_uv = vec2(a_uv_x, a_split_index * texel_height - half_texel_height);
+    v_global_progress = a_global_progress;
 
     vec2 pos = floor(a_pos_normal * 0.5);
 

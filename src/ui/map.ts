@@ -3979,6 +3979,30 @@ export class Map extends Camera {
         return this;
     }
 
+    /**
+     * Clip a line layer's rendering to the leading fraction of each feature's length.
+     * Fragments beyond `progress` (0..1) are discarded in the shader, so animating a
+     * line "growing" along its geometry costs one uniform per frame instead of a
+     * geometry re-upload and worker round-trip per frame. Pass null to disable.
+     *
+     * Requires the layer to use `line-gradient` (that program variant carries
+     * per-vertex line progress) and its GeoJSON source to set `lineMetrics: true`.
+     * Progress is per feature — multi-feature data animates all features in parallel.
+     */
+    setLineProgressClip(layerId: string, progress: number | null): this {
+        const layer = this.style?.getLayer(layerId) as {lineProgressClip?: number | null; source?: string};
+        if (!layer || !('lineProgressClip' in layer)) return this;
+        if (layer.lineProgressClip === progress) return this;
+        layer.lineProgressClip = progress;
+        // draped line layers render from cached terrain stack textures — mark the
+        // source's stacks dirty so the clip change is visible in 3D
+        if (layer.source && this.painter?.renderToTexture) {
+            this.painter.renderToTexture.markSourceChanged(layer.source);
+        }
+        this.triggerRepaint();
+        return this;
+    }
+
     _measureRenderedFrame(cpuMs: number) {
         const gl = this.painter?.context?.gl as WebGL2RenderingContext;
         if (gl?.fenceSync && !gl.isContextLost()) {

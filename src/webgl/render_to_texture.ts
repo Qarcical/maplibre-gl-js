@@ -105,7 +105,7 @@ export class RenderToTexture {
      * tiles). Processed in prepareForRender: each entry re-renders only the stacks that
      * drape the changed source, only on terrain tiles overlapping the changed tile.
      */
-    _pendingSourceTileChanges: Array<{sourceId: string; tileID: OverscaledTileID}>;
+    _pendingSourceTileChanges: Array<{sourceId: string; tileID?: OverscaledTileID}>;
     constructor(painter: Painter, terrain: Terrain) {
         this.painter = painter;
         this.terrain = terrain;
@@ -133,6 +133,16 @@ export class RenderToTexture {
      */
     markSourceTileChanged(sourceId: string, tileID: OverscaledTileID) {
         this._pendingSourceTileChanges.push({sourceId, tileID});
+    }
+
+    /**
+     * Notification that a source's rendering changed everywhere without its data
+     * changing (e.g. a per-frame uniform like the line progress clip). Invalidates the
+     * stacks draping this source on all terrain tiles — the per-tile content skip
+     * still limits actual re-rendering to tiles where the source has something to draw.
+     */
+    markSourceChanged(sourceId: string) {
+        this._pendingSourceTileChanges.push({sourceId});
     }
 
     prepareForRender(style: Style, zoom: number) {
