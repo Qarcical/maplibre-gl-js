@@ -141,7 +141,9 @@ export class DEMData {
     // never packed bytes. (Filtering packed terrarium/custom bytes blends each channel separately
     // and unpacks the blend — worst at 0 m, where the carry byte flips 127→128 and a blended R
     // contributes a spurious ±128 m.) Lazily built and cached; backfillBorder invalidates.
-    _floatData: Float32Array | null = null;
+    // Optional (never null): omitted from serialization, and deserialize skips field
+    // initializers — undefined keeps fresh and round-tripped instances deeply equal.
+    _floatData?: Float32Array;
 
     getFloatPixels(): {width: number; height: number; data: Float32Array} {
         if (!this._floatData) {
@@ -158,7 +160,7 @@ export class DEMData {
 
     backfillBorder(borderTile: DEMData, dx: number, dy: number) {
         if (this.dim !== borderTile.dim) throw new Error('dem dimension mismatch');
-        this._floatData = null;   // PATCH (map2-fork): packed data changes below — refresh floats on next use
+        this._floatData = undefined;   // PATCH (map2-fork): packed data changes below — refresh floats on next use
 
         let xMin = dx * this.dim,
             xMax = dx * this.dim + this.dim,
@@ -207,4 +209,5 @@ export function packDEMData(v: number, unpackVector: number[]): {r: number; g: n
     };
 }
 
-register('DEMData', DEMData);
+// PATCH (map2-fork): _floatData is a lazy per-instance cache; rebuilt on demand after transfer.
+register('DEMData', DEMData, {omit: ['_floatData']});

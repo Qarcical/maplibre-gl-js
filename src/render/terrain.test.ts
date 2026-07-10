@@ -133,7 +133,8 @@ describe('Terrain', () => {
             min: 0,
             max: 100,
             getPixels: () => new RGBAImage({width: 1, height: 1}, new Uint8Array(1 * 4)),
-            getUnpackVector: () => [6553.6, 25.6, 0.1, 10000.0],
+            // PATCH (map2-fork): terrain uploads the DEM as R32F metres via getFloatPixels
+            getFloatPixels: () => ({width: 1, height: 1, data: new Float32Array(1)}),
         } as any as DEMData;
         const painter = {
             context: new Context(gl),
