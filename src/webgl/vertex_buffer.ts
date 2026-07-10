@@ -6,6 +6,7 @@ import type {
 
 import type {Program} from './program';
 import type {Context} from './context';
+import {glStats} from './gl_stats';
 
 /**
  * An Enum for AttributeType
@@ -47,6 +48,10 @@ export class VertexBuffer {
         this.buffer = gl.createBuffer();
         context.bindVertexBuffer.set(this.buffer);
         gl.bufferData(gl.ARRAY_BUFFER, array.arrayBuffer, this.dynamicDraw ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+        if (glStats.enabled) {
+            glStats.frame.bufferUploads++;
+            glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
+        }
 
         if (!this.dynamicDraw) {
             array.freeBufferAfterUpload();
@@ -62,6 +67,10 @@ export class VertexBuffer {
         const gl = this.context.gl;
         this.bind();
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, array.arrayBuffer);
+        if (glStats.enabled) {
+            glStats.frame.bufferUploads++;
+            glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
+        }
     }
 
     enableAttributes(gl: WebGLRenderingContext|WebGL2RenderingContext, program: Program<any>) {

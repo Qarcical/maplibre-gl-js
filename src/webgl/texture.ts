@@ -67,6 +67,13 @@ export class Texture {
         const {context} = this;
         const {gl} = context;
 
+        // Null-data calls only allocate storage (pool framebuffers); everything else
+        // pushes real pixels through the driver — the streaming-burst upload cost.
+        if (glStats.enabled && !(hasDataProperty(image) && !image.data)) {
+            glStats.frame.texUploads++;
+            glStats.frame.texUploadBytes += width * height * 4;
+        }
+
         this.useMipmap = Boolean(options?.useMipmap);
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
 

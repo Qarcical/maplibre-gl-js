@@ -2,6 +2,7 @@
 import type {StructArray} from '../util/struct_array';
 import type {TriangleIndexArray, LineIndexArray, LineStripIndexArray} from '../data/index_array_type';
 import type {Context} from './context';
+import {glStats} from './gl_stats';
 
 /**
  * @internal
@@ -25,6 +26,10 @@ export class IndexBuffer {
 
         context.bindElementBuffer.set(this.buffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, array.arrayBuffer, this.dynamicDraw ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+        if (glStats.enabled) {
+            glStats.frame.bufferUploads++;
+            glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
+        }
 
         if (!this.dynamicDraw) {
             array.freeBufferAfterUpload();
@@ -43,6 +48,10 @@ export class IndexBuffer {
         this.context.unbindVAO();
         this.bind();
         gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, array.arrayBuffer);
+        if (glStats.enabled) {
+            glStats.frame.bufferUploads++;
+            glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
+        }
     }
 
     destroy() {

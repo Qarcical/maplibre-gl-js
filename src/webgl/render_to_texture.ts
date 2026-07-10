@@ -10,6 +10,7 @@ import {glStats} from './gl_stats';
 import {type Texture} from './texture';
 import type {StyleLayer} from '../style/style_layer';
 import {ImageSource} from '../source/image_source';
+import {warnOnce} from '../util/util';
 
 /**
  * lookup table which layers should rendered to texture
@@ -279,8 +280,14 @@ export class RenderToTexture {
 
         // Size the pools so a full frame's (tile × stack) textures can stay cached across
         // frames — recycling a free pool object evicts whatever cache entry it backs.
-        // When the byte budget can't cover the full demand, shrink both tiers
-        // proportionally; the MRU-on-overflow eviction keeps the resident set stable.
+        // Capacity must never drop below the frame's demand: with capacity short of the
+        // working set, every churn miss recycles an object a live entry used this frame,
+        // that entry misses next frame and evicts another — the cascade saturates the
+        // cache (measured on a 512MB-budget tablet at demand 90 / slots 60: every stack
+        // re-rendering every frame, RTT draws 50–70% of all draw calls). Exceeding the
+        // byte budget is strictly cheaper than thrashing under it, so the budget only
+        // warns; when a device genuinely can't afford the working set, the levers are
+        // demand-side (fewer stacks, lower qualityFactor), not a smaller pool.
         const tileSize = this.terrain.tileManager.tileSize;
         const bytesPerObject = [(tileSize * this.terrain.qualityFactor) ** 2 * 4, tileSize ** 2 * 4];
         const demand = [0, 0];
@@ -290,9 +297,13 @@ export class RenderToTexture {
         }
         const neededBytes = demand[0] * bytesPerObject[0] + demand[1] * bytesPerObject[1];
         const budgetBytes = style.map._rttPoolBudgetBytes || getPoolBudgetBytes();
-        const scale = neededBytes > 0 && Number.isFinite(neededBytes) ? Math.min(1, budgetBytes / neededBytes) : 1;
+        if (neededBytes > budgetBytes) {
+            // Fixed message — warnOnce dedupes by exact text, so the fluctuating
+            // working-set size must not be in it (glstats pool slots/demand has it).
+            warnOnce(`[rtt] texture working set exceeds the pool budget (${Math.round(budgetBytes / (1024 * 1024))}MB); allocating it anyway — reduce stacks or quality to lower demand`);
+        }
         for (let tier = 0; tier < this.pools.length; tier++) {
-            this.pools[tier].setSize(Math.max(30, Math.floor(demand[tier] * scale)));
+            this.pools[tier].setSize(Math.max(30, demand[tier]));
         }
         if (glStats.enabled) {
             glStats.frame.rttPoolSlots = this.pools[0].size + this.pools[1].size;

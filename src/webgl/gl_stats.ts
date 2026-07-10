@@ -51,6 +51,14 @@ export type GlStatsFrame = {
     rttPoolDemand: number;
     /** terrain-mesh composite draws (tile × stack passes to screen) */
     terrainComposites: number;
+    /** texImage2D/texSubImage2D calls carrying data (null-data allocations excluded) */
+    texUploads: number;
+    /** bytes uploaded by those texture calls (width × height × 4 for both RGBA8 and R32F) */
+    texUploadBytes: number;
+    /** bufferData/bufferSubData calls (vertex + index buffers) */
+    bufferUploads: number;
+    /** bytes uploaded by those buffer calls */
+    bufferUploadBytes: number;
 };
 
 function zeroFrame(): GlStatsFrame {
@@ -71,6 +79,10 @@ function zeroFrame(): GlStatsFrame {
         rttPoolSlots: 0,
         rttPoolDemand: 0,
         terrainComposites: 0,
+        texUploads: 0,
+        texUploadBytes: 0,
+        bufferUploads: 0,
+        bufferUploadBytes: 0,
     };
 }
 

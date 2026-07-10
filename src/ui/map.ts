@@ -4205,16 +4205,30 @@ export class Map extends Camera {
         const sortNum = (a: number, b: number) => a - b;
         const cpus = this._framePerf.map(s => s.cpu).sort(sortNum);
         const gpus = this._framePerf.map(s => s.gpu).sort(sortNum);
-        const depths = this._framePerf.map(s => s.depth).sort(sortNum);
+        const depthsRaw = this._framePerf.map(s => s.depth);
+        const depths = [...depthsRaw].sort(sortNum);
         this._framePerf = [];
         const cpuMedian = cpus[cpus.length >> 1];
         const gpuMedian = gpus[gpus.length >> 1];
         const depthMedian = depths[depths.length >> 1];
+        // Queue-depth TREND across the window (median of the second half vs the
+        // first, in completion order). A slower GPU pipelines deeper — a flat
+        // q2–3 while still presenting every frame is normal there, and demoting
+        // on the absolute median made the governor flap 30↔60 (measured on a
+        // 60Hz tablet). Overload is the queue GROWING through the window; a
+        // deep-but-stable queue only demotes past the latency backstop below.
+        const halfLen = depthsRaw.length >> 1;
+        const firstHalf = depthsRaw.slice(0, halfLen).sort(sortNum);
+        const secondHalf = depthsRaw.slice(halfLen).sort(sortNum);
+        const depthGrowing = secondHalf[secondHalf.length >> 1] - firstHalf[firstHalf.length >> 1] >= 2;
         const now = performance.now();
 
         const tier = Math.min(this._frameRateTier, divisors.length - 1);
         let newTier = tier;
-        if (tier < divisors.length - 1 && (cpuMedian > vsync * divisors[tier] * 1.05 || depthMedian >= 3)) {
+        if (tier < divisors.length - 1 &&
+            (cpuMedian > vsync * divisors[tier] * 1.05 ||
+             depthMedian >= 5 ||
+             (depthMedian >= 3 && depthGrowing))) {
             // main thread overruns the budget, or the GPU queue is backing up —
             // step down, and hold the slower tier for a while: bouncing straight
             // back up feels like a hitch. A failed probe (demotion soon after a
