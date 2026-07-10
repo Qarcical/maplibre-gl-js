@@ -31,14 +31,16 @@ describe('render pool', () => {
         expect(pool.isFull()).toBeTruthy();
     });
 
-    test('check recently used after using two objects', () =>  {
+    test('at capacity the most recently used free object is recycled', () =>  {
         const pool = createAndFillPool();
         pool.freeAllObjects();
         const obj0 = pool.getObjectForId(0);
         pool.useObject(obj0);
         pool.freeAllObjects();
-        const obj1 = pool.getOrCreateFreeObject();
-        expect(obj1.id).toBe(1);
+        // recycling the most recently used free object keeps the resident set stable
+        // when per-frame demand exceeds the pool's capacity
+        const recycled = pool.getOrCreateFreeObject();
+        expect(recycled.id).toBe(0);
     });
 
     test('not full after freeing an object', () =>  {
@@ -56,10 +58,10 @@ describe('render pool', () => {
         expect(obj.stamp).toBe(1);
     });
 
-    test('free all objects, first object should be the first free object', () =>  {
+    test('free all objects, most recently used object is recycled first', () =>  {
         const pool = createAndFillPool();
         pool.freeAllObjects();
-        expect(pool.getOrCreateFreeObject().id).toBe(0);
+        expect(pool.getOrCreateFreeObject().id).toBe(POOL_SIZE - 1);
     });
 
     test('destruct should remove textures', () =>  {

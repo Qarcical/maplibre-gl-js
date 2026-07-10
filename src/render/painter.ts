@@ -101,6 +101,11 @@ export class Painter {
     quadTriangleIndexBuffer: IndexBuffer;
     tileBorderIndexBuffer: IndexBuffer;
     _tileClippingMaskIDs: {[_: string]: number};
+    /**
+     * true while the current layer's tiles need no stencil clipping (a single source
+     * tile covering the whole render target) — stencilModeForClipping returns disabled
+     */
+    _clippingDisabled: boolean;
     stencilClearMode: StencilMode;
     style: Style;
     options: PainterOptions;
@@ -231,6 +236,7 @@ export class Painter {
 
         this.nextStencilID = 1;
         this.currentStencilSource = undefined;
+        this._clippingDisabled = false;
 
         // As a temporary workaround for https://github.com/mapbox/mapbox-gl-js/issues/5490,
         // pending an upstream fix, we draw a fullscreen stencil=0 clipping mask here,
@@ -257,12 +263,21 @@ export class Painter {
             this.quadTriangleIndexBuffer, this.viewportSegments);
     }
 
-    _renderTileClippingMasks(layer: StyleLayer, tileIDs: OverscaledTileID[], renderToTexture: boolean) {
+    _renderTileClippingMasks(layer: StyleLayer, tileIDs: OverscaledTileID[], renderToTexture: boolean, noClipNeeded: boolean = false) {
         if (this.currentStencilSource === layer.source || !layer.isTileClipped() || !tileIDs?.length) {
             return;
         }
 
         this.currentStencilSource = layer.source;
+
+        if (noClipNeeded) {
+            // a single source tile covering the whole render target can neither overlap
+            // another tile nor bleed its buffer inside the target — skip the mask
+            // stamping entirely and draw the layer without a stencil test
+            this._clippingDisabled = true;
+            return;
+        }
+        this._clippingDisabled = false;
 
         if (this.nextStencilID + tileIDs.length > 256) {
             // we'll run out of fresh IDs so we need to clear and start from scratch
@@ -358,6 +373,9 @@ export class Painter {
     }
 
     stencilModeForClipping(tileID: OverscaledTileID): StencilMode {
+        if (this._clippingDisabled) {
+            return StencilMode.disabled;
+        }
         const gl = this.context.gl;
         return new StencilMode({func: gl.EQUAL, mask: 0xFF}, this._tileClippingMaskIDs[tileID.key], 0x00, gl.KEEP, gl.KEEP, gl.REPLACE);
     }

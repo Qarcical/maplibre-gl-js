@@ -99,6 +99,12 @@ export class Terrain {
      */
     qualityFactor: number;
     /**
+     * memoized result of the covering-tiles sweep in getElevationForLngLat: the best
+     * query zoom only changes when the camera does, but the sweep was running once per
+     * queried point (e.g. for every marker projected on every camera move).
+     */
+    _elevationQueryZoomCache: {key: string; zoom: number};
+    /**
      * holds the framebuffer object in size of the screen to render the coords & depth into a texture.
      */
     _fbo: Framebuffer;
@@ -232,14 +238,20 @@ export class Terrain {
      * @returns the elevation
      */
     getElevationForLngLat(lnglat: LngLat, transform: IReadonlyTransform) {
-        const terrainCoveringTiles = coveringTiles(transform, {maxzoom: this.tileManager.maxzoom, minzoom: this.tileManager.minzoom, tileSize: 512, terrain: this});
-        let zoom = 0;
-        for (const tile of terrainCoveringTiles) {
-            if (tile.canonical.z > zoom) {
-                zoom = Math.min(tile.canonical.z, this.tileManager.maxzoom);
+        // the covering-tiles sweep only depends on the camera — memoize it so per-point
+        // callers (marker/point projection on every camera move) don't recompute it
+        const cacheKey = `${transform.center.lng}/${transform.center.lat}/${transform.zoom}/${transform.pitch}/${transform.bearing}/${transform.elevation}/${transform.width}/${transform.height}/${this.tileManager._lastTilesetChange}`;
+        if (this._elevationQueryZoomCache?.key !== cacheKey) {
+            const terrainCoveringTiles = coveringTiles(transform, {maxzoom: this.tileManager.maxzoom, minzoom: this.tileManager.minzoom, tileSize: 512, terrain: this});
+            let zoom = 0;
+            for (const tile of terrainCoveringTiles) {
+                if (tile.canonical.z > zoom) {
+                    zoom = Math.min(tile.canonical.z, this.tileManager.maxzoom);
+                }
             }
+            this._elevationQueryZoomCache = {key: cacheKey, zoom};
         }
-        return this.getElevationForLngLatZoom(lnglat, zoom);
+        return this.getElevationForLngLatZoom(lnglat, this._elevationQueryZoomCache.zoom);
     }
 
     /**

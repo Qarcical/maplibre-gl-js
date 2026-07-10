@@ -51,6 +51,13 @@ describe('render to texture', () => {
         source: 'maine',
         isHidden: () => false
     } as any as LineStyleLayer;
+    const breakLineLayer = {
+        id: 'maine-line-break',
+        type: 'line',
+        source: 'maine',
+        metadata: {'map2:rtt-stack-break': true},
+        isHidden: () => false
+    } as any as LineStyleLayer;
     const symbolLayer = {
         id: 'maine-symbol',
         type: 'symbol',
@@ -80,6 +87,13 @@ describe('render to texture', () => {
     const map = {painter} as Map;
 
     const tile = new Tile(new OverscaledTileID(3, 0, 2, 1, 2), 512);
+    // buckets so the stack content check sees these layers as drawable on the tile
+    tile.buckets = {
+        'maine-fill': {} as any,
+        'maine-hillshade': {} as any,
+        'maine-line': {} as any,
+        'maine-line-break': {} as any
+    };
     const tileManager = {
         _source: {minzoom: 0, maxzoom: 2},
         getTileByID: (_id) => tile,
@@ -90,6 +104,7 @@ describe('render to texture', () => {
         tileManagers: {
             'maine': {
                 getVisibleCoordinates: () => [tile.tileID],
+                getTileByID: (_id) => tile,
                 getSource: () => ({}),
                 getState: vi.fn().mockReturnValue({revision: 0})
             }
@@ -101,6 +116,7 @@ describe('render to texture', () => {
             'maine-raster': rasterLayer,
             'maine-hillshade': hillshadeLayer,
             'maine-line': lineLayer,
+            'maine-line-break': breakLineLayer,
             'maine-symbol': symbolLayer
         },
         projection: {
@@ -148,20 +164,20 @@ describe('render to texture', () => {
         rtt.prepareForRender(style, 0);
 
         tile.rttFingerprint = {maine: '923#0'};
-        tile.rtt = [{id: 1, stamp: 123}];
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
 
         const otherTileID = new OverscaledTileID(3, 0, 2, 2, 2);
         (terrain.tileManager.getTerrainCoords as Mock).mockReturnValueOnce({[tile.tileID.key]: otherTileID});
 
         rtt.prepareForRender(style, 0);
 
-        expect(tile.rtt.length).toBe(0);
+        expect(tile.rtt[0]).toBeNull();
     });
 
     test('should not clear tile cache if state remains same', () => {
         rtt.prepareForRender(style, 0);
         tile.rttFingerprint = {maine: '923#0'};
-        tile.rtt = [{id: 1, stamp: 123}];
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
 
         rtt.prepareForRender(style, 0);
 
@@ -214,7 +230,7 @@ describe('render to texture', () => {
         const state = {revision: 0};
         (style.tileManagers['maine'].getState as Mock).mockReturnValue(state);
 
-        tile.rtt = [{id: 1, stamp: 123}];
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
         tile.rttFingerprint = {maine: '923#0'};
 
         rtt.prepareForRender(style, 0);
@@ -222,6 +238,38 @@ describe('render to texture', () => {
 
         state.revision = 1;
         rtt.prepareForRender(style, 0);
-        expect(tile.rtt.length).toBe(0);
+        expect(tile.rtt[0]).toBeNull();
+    });
+
+    test('metadata stack break renders the prior stack and starts a new one', () => {
+        style._order = ['maine-fill', 'maine-line-break'];
+        rtt.prepareForRender(style, 0);
+        layersDrawn = 0;
+        const renderOptions = {isRenderingToTexture: false, isRenderingGlobe: false};
+        expect(rtt.renderLayer(fillLayer, renderOptions)).toBeTruthy();
+        expect(rtt.renderLayer(breakLineLayer, renderOptions)).toBeTruthy();
+        expect(rtt._stacks).toStrictEqual([['maine-fill'], ['maine-line-break']]);
+        // one terrain composite per stack, one tile each
+        expect(layersDrawn).toBe(2);
+    });
+
+    test('markSourceTileChanged invalidates only stacks draping the source', () => {
+        style._order = ['maine-fill', 'maine-symbol'];
+        (style.tileManagers['maine'].getState as Mock).mockReturnValue({revision: 0});
+        (terrain.tileManager as any)._tiles = {[tile.tileID.key]: tile};
+        rtt.prepareForRender(style, 0);
+
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
+        tile.rttFingerprint = {maine: '923#0'};
+
+        // a source with no draped layers (e.g. one only used by symbols) changes nothing
+        rtt.markSourceTileChanged('not-draped', tile.tileID);
+        rtt.prepareForRender(style, 0);
+        expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123});
+
+        // a draped source invalidates the stack that drapes it
+        rtt.markSourceTileChanged('maine', tile.tileID);
+        rtt.prepareForRender(style, 0);
+        expect(tile.rtt[0]).toBeNull();
     });
 });

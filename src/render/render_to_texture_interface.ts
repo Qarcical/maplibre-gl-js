@@ -1,6 +1,7 @@
 import type {Style} from '../style/style';
 import type {StyleLayer} from '../style/style_layer';
 import type {Tile} from '../tile/tile';
+import type {OverscaledTileID} from '../tile/tile_id';
 import type {RenderOptions} from './painter';
 
 /**
@@ -11,5 +12,6 @@ export interface IRenderToTexture {
     prepareForRender(style: Style, zoom: number): void;
     renderLayer(layer: StyleLayer, renderOptions: RenderOptions): boolean;
     getTexture(tile: Tile): any;
+    markSourceTileChanged(sourceId: string, tileID: OverscaledTileID): void;
     destruct(): void;
 }

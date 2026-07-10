@@ -21,10 +21,16 @@ export class RenderPool {
      */
     private _recentlyUsed: number[];
     private _stamp: number;
+    /**
+     * One depth-stencil renderbuffer shared by every framebuffer in the pool: pool
+     * framebuffers are only ever rendered to one at a time, and sharing halves the
+     * pool's GPU memory — which is what bounds how many textures can stay cached.
+     */
+    private _sharedDepthStencil: WebGLRenderbuffer;
 
     constructor(
         private readonly _context: Context,
-        private readonly _size: number,
+        private _size: number,
         private readonly _tileSize: number) {
         this._objects = [];
         this._recentlyUsed = [];
@@ -38,6 +44,15 @@ export class RenderPool {
         }
     }
 
+    /**
+     * Adjust the pool's capacity. The pool grows lazily on demand. An existing
+     * over-capacity object population is kept (deleting objects would break the
+     * id-based addressing of cached render-to-texture entries).
+     */
+    public setSize(size: number) {
+        this._size = size;
+    }
+
     private _createObject(id: number): PoolObject {
         const fbo = this._context.createFramebuffer(this._tileSize, this._tileSize, true, true);
         const texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA);
@@ -45,7 +60,8 @@ export class RenderPool {
         if (this._context.extTextureFilterAnisotropic) {
             this._context.gl.texParameterf(this._context.gl.TEXTURE_2D, this._context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this._context.extTextureFilterAnisotropicMax);
         }
-        fbo.depthAttachment.set(this._context.createRenderbuffer(this._context.gl.DEPTH_STENCIL, this._tileSize, this._tileSize));
+        this._sharedDepthStencil ||= this._context.createRenderbuffer(this._context.gl.DEPTH_STENCIL, this._tileSize, this._tileSize);
+        fbo.depthAttachment.set(this._sharedDepthStencil);
         fbo.colorAttachment.set(texture.texture);
         return {id, fbo, texture, stamp: -1, inUse: false};
     }
@@ -65,17 +81,24 @@ export class RenderPool {
     }
 
     public getOrCreateFreeObject(): PoolObject {
-        // check for free existing object
-        for (const id of this._recentlyUsed) {
-            if (!this._objects[id].inUse)
-                return this._objects[id];
+        // Grow before reusing: every free object may back a render-to-texture cache
+        // entry, and re-stamping one silently evicts that entry.
+        if (this._objects.length < this._size) {
+            const obj = this._createObject(this._objects.length);
+            this._objects.push(obj);
+            return obj;
         }
-        if (this._objects.length >= this._size)
-            throw new Error('No free RenderPool available, call freeAllObjects() required!');
-        // create new object
-        const obj = this._createObject(this._objects.length);
-        this._objects.push(obj);
-        return obj;
+        // At capacity, evict the MOST recently used free object. Every cached entry is
+        // touched once per frame in a fixed order, so when demand exceeds capacity an
+        // LRU victim is the entry that will be needed soonest — hit rate collapses to
+        // zero. Sacrificing the most recently touched entry keeps a stable resident
+        // set; only (demand - capacity) entries re-render per frame.
+        for (let i = this._recentlyUsed.length - 1; i >= 0; i--) {
+            const obj = this._objects[this._recentlyUsed[i]];
+            if (!obj.inUse)
+                return obj;
+        }
+        throw new Error('No free RenderPool available, call freeAllObjects() required!');
     }
 
     public freeObject(obj: PoolObject) {

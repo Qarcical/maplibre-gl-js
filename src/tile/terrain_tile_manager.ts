@@ -59,6 +59,14 @@ export class TerrainTileManager extends Evented {
      * used to determine whether depth & coord framebuffers need updating
      */
     _lastTilesetChange: number = now();
+    /**
+     * memoized terrain-coords results per (source tile, terrain tile) pair. The mapping
+     * (a clone of the source tileID carrying the ortho matrix onto the terrain tile)
+     * depends only on the two tile IDs, but is recomputed for every visible source tile
+     * of every source on every frame — caching it removes per-frame mat4/clone churn.
+     * null marks a pair with no overlap.
+     */
+    _terrainCoordsCache: Map<string, OverscaledTileID | null>;
 
     constructor(tileManager: TileManager) {
         super();
@@ -66,6 +74,7 @@ export class TerrainTileManager extends Evented {
         this._tiles = {};
         this._renderableTilesKeys = [];
         this._sourceTileCache = {};
+        this._terrainCoordsCache = new Map();
         this.minzoom = 0;
         this.maxzoom = 22;
         this.deltaZoom = 1;
@@ -120,12 +129,20 @@ export class TerrainTileManager extends Evented {
     /**
      * Free render to texture cache
      * @param tileID - optional, free only corresponding to tileID.
+     * @param stacks - optional, free only the given render-stack indices instead of every stack.
      */
-    freeRtt(tileID?: OverscaledTileID) {
+    freeRtt(tileID?: OverscaledTileID, stacks?: number[]) {
         for (const key in this._tiles) {
             const tile = this._tiles[key];
-            if (!tileID || tile.tileID.equals(tileID) || tile.tileID.isChildOf(tileID) || tileID.isChildOf(tile.tileID))
-                tile.rtt = [];
+            if (!tileID || tile.tileID.equals(tileID) || tile.tileID.isChildOf(tileID) || tileID.isChildOf(tile.tileID)) {
+                if (stacks) {
+                    for (const stack of stacks) {
+                        tile.rtt[stack] = null;
+                    }
+                } else {
+                    tile.rtt = [];
+                }
+            }
         }
     }
 
@@ -174,33 +191,45 @@ export class TerrainTileManager extends Evented {
     _getTerrainCoordsForRegularTile(tileID: OverscaledTileID): Record<string, OverscaledTileID> {
         const coords: Record<string, OverscaledTileID> = {};
         for (const key of this._renderableTilesKeys) {
-            const terrainTileID = this._tiles[key].tileID;
-            const coord = tileID.clone();
-            const mat = createMat4f64();
-            if (terrainTileID.canonical.equals(tileID.canonical)) {
-                mat4.ortho(mat, 0, EXTENT, EXTENT, 0, 0, 1);
-            } else if (terrainTileID.canonical.isChildOf(tileID.canonical)) {
-                const dz = terrainTileID.canonical.z - tileID.canonical.z;
-                const dx = terrainTileID.canonical.x - (terrainTileID.canonical.x >> dz << dz);
-                const dy = terrainTileID.canonical.y - (terrainTileID.canonical.y >> dz << dz);
-                const size = EXTENT >> dz;
-                mat4.ortho(mat, 0, size, size, 0, 0, 1); // Note: we are using `size` instead of `EXTENT` here
-                mat4.translate(mat, mat, [-dx * size, -dy * size, 0]);
-            } else if (tileID.canonical.isChildOf(terrainTileID.canonical)) {
-                const dz = tileID.canonical.z - terrainTileID.canonical.z;
-                const dx = tileID.canonical.x - (tileID.canonical.x >> dz << dz);
-                const dy = tileID.canonical.y - (tileID.canonical.y >> dz << dz);
-                const size = EXTENT >> dz;
-                mat4.ortho(mat, 0, EXTENT, EXTENT, 0, 0, 1);
-                mat4.translate(mat, mat, [dx * size, dy * size, 0]);
-                mat4.scale(mat, mat, [1 / (2 ** dz), 1 / (2 ** dz), 0]);
-            } else {
+            const cacheKey = `${tileID.key}#${key}`;
+            let coord = this._terrainCoordsCache.get(cacheKey);
+            if (coord !== undefined) {
+                if (coord !== null) coords[key] = coord;
                 continue;
             }
-            coord.terrainRttPosMatrix32f = new Float32Array(mat);
-            coords[key] = coord;
+            coord = this._computeTerrainCoordForRegularTile(tileID, this._tiles[key].tileID);
+            if (this._terrainCoordsCache.size > 10000) this._terrainCoordsCache.clear();
+            this._terrainCoordsCache.set(cacheKey, coord);
+            if (coord !== null) coords[key] = coord;
         }
         return coords;
+    }
+
+    _computeTerrainCoordForRegularTile(tileID: OverscaledTileID, terrainTileID: OverscaledTileID): OverscaledTileID | null {
+        const coord = tileID.clone();
+        const mat = createMat4f64();
+        if (terrainTileID.canonical.equals(tileID.canonical)) {
+            mat4.ortho(mat, 0, EXTENT, EXTENT, 0, 0, 1);
+        } else if (terrainTileID.canonical.isChildOf(tileID.canonical)) {
+            const dz = terrainTileID.canonical.z - tileID.canonical.z;
+            const dx = terrainTileID.canonical.x - (terrainTileID.canonical.x >> dz << dz);
+            const dy = terrainTileID.canonical.y - (terrainTileID.canonical.y >> dz << dz);
+            const size = EXTENT >> dz;
+            mat4.ortho(mat, 0, size, size, 0, 0, 1); // Note: we are using `size` instead of `EXTENT` here
+            mat4.translate(mat, mat, [-dx * size, -dy * size, 0]);
+        } else if (tileID.canonical.isChildOf(terrainTileID.canonical)) {
+            const dz = tileID.canonical.z - terrainTileID.canonical.z;
+            const dx = tileID.canonical.x - (tileID.canonical.x >> dz << dz);
+            const dy = tileID.canonical.y - (tileID.canonical.y >> dz << dz);
+            const size = EXTENT >> dz;
+            mat4.ortho(mat, 0, EXTENT, EXTENT, 0, 0, 1);
+            mat4.translate(mat, mat, [dx * size, dy * size, 0]);
+            mat4.scale(mat, mat, [1 / (2 ** dz), 1 / (2 ** dz), 0]);
+        } else {
+            return null;
+        }
+        coord.terrainRttPosMatrix32f = new Float32Array(mat);
+        return coord;
     }
 
     /**

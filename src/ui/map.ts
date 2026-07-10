@@ -559,6 +559,33 @@ export class Map extends Camera {
     _maxTileCacheSize: number | null;
     _maxTileCacheZoomLevels: number;
     _frameRequest: AbortController;
+    /**
+     * minimum interval between rendered frames in ms (0 = render on every animation
+     * frame the browser offers). See {@link Map#setMaxFrameRate}.
+     */
+    _maxFrameInterval: number = 0;
+    _lastRenderTimestamp: number = -Infinity;
+    /**
+     * adaptive frame-rate governor state (see {@link Map#setMaxFrameRate} with 'auto'):
+     * measures per-frame main-thread render cost and GPU completion time (via fence
+     * sync objects) and steps the frame cap through integer divisors of the display
+     * rate so the map renders at the fastest rate the device actually sustains.
+     */
+    /**
+     * render line-only terrain texture stacks at half resolution — quarter the GPU
+     * memory per texture at the cost of softer draped overlay lines. See
+     * {@link Map#setLowResLineStacks}.
+     */
+    _lowResLineStacks: boolean = false;
+    _autoFrameRate: boolean = false;
+    _rafDeltas: number[] = [];
+    _lastRafTimestamp: number = -Infinity;
+    _frameRateTier: number = 0;
+    _tierHeadroomStreak: number = 0;
+    _stepUpBlockedUntil: number = 0;
+    _framePerf: Array<{cpu: number; gpu: number}> = [];
+    _pendingGpuFences: Array<{sync: WebGLSync; start: number; cpu: number}> = [];
+    _fencePollTimer: ReturnType<typeof setTimeout> = null;
     _styleDirty: boolean;
     _sourcesDirty: boolean;
     _placementDirty: boolean;
@@ -2399,6 +2426,11 @@ export class Map extends Camera {
 
                     if (e.source?.type === 'image') {
                         this.terrain.tileManager.freeRtt();
+                    } else if (this.painter.renderToTexture) {
+                        // invalidate at stack granularity: only the render stacks that
+                        // drape this source are re-rendered, and only on terrain tiles
+                        // overlapping the changed tile
+                        this.painter.renderToTexture.markSourceTileChanged(e.sourceId, e.tile.tileID);
                     } else {
                         this.terrain.tileManager.freeRtt(e.tile.tileID);
                     }
@@ -3810,6 +3842,11 @@ export class Map extends Camera {
             this._frameRequest.abort();
             this._frameRequest = null;
         }
+        if (this._fencePollTimer != null) {
+            clearTimeout(this._fencePollTimer);
+            this._fencePollTimer = null;
+        }
+        this._pendingGpuFences = [];
         this._renderTaskQueue.clear();
         this._diffStyleRequest?.abort();
         this.painter.destroy();
@@ -3854,6 +3891,28 @@ export class Map extends Camera {
                 this._frameRequest,
                 (paintStartTimeStamp) => {
                     this._frameRequest = null;
+                    // raw animation-frame cadence — sampled on every callback, including skipped
+                    // ones. Kept as a window and read at a low percentile: callbacks can
+                    // only ever arrive LATE relative to the display's refresh (a slow frame
+                    // stretches its delta to 2+ ticks), so an average over-estimates the
+                    // interval — the near-minimum is the true vsync.
+                    const rafDelta = paintStartTimeStamp - this._lastRafTimestamp;
+                    this._lastRafTimestamp = paintStartTimeStamp;
+                    if (rafDelta > 1 && rafDelta < 100) {
+                        this._rafDeltas.push(rafDelta);
+                        if (this._rafDeltas.length > 64) this._rafDeltas.shift();
+                    }
+                    this._pollGpuFences();
+                    // Frame-rate cap: if this animation frame arrives too soon after the
+                    // last render, skip it and re-schedule. The half-tick tolerance (4ms)
+                    // lets a 60fps cap lock cleanly onto every second vsync of a 120Hz
+                    // display instead of oscillating between skipping one and two ticks.
+                    if (this._maxFrameInterval > 0 && paintStartTimeStamp - this._lastRenderTimestamp < this._maxFrameInterval - 4) {
+                        this.triggerRepaint();
+                        return;
+                    }
+                    this._lastRenderTimestamp = paintStartTimeStamp;
+                    const cpuStart = performance.now();
                     try {
                         this._render(paintStartTimeStamp);
                     } catch(error) {
@@ -3861,10 +3920,172 @@ export class Map extends Camera {
                             throw error;
                         }
                     }
+                    if (this._autoFrameRate) {
+                        this._measureRenderedFrame(performance.now() - cpuStart);
+                        this._maybeAdaptFrameRate();
+                    }
                 },
                 () => {},
                 this._ownerWindow
             );
+        }
+    }
+
+    /**
+     * Cap the map's render loop to a maximum frame rate. On high-refresh displays
+     * (e.g. 120Hz) the map otherwise renders on every animation frame; capping to a
+     * divisor of the display rate (60, 40, 30) trades motion smoothness for CPU/GPU
+     * headroom — useful on devices where full-rate frames can't be sustained anyway.
+     *
+     * Pass `'auto'` to let the map govern itself: it measures each rendered frame's
+     * main-thread cost and GPU completion time (fence syncs) and settles on the fastest
+     * divisor of the display rate (min 30fps) the device sustains, re-probing for
+     * headroom as conditions change. Fires a `framerate` event whenever the governed
+     * rate changes.
+     *
+     * @param maxFps - frames per second, `'auto'`, or 0/undefined to remove the cap
+     */
+    setMaxFrameRate(maxFps?: number | 'auto'): this {
+        if (maxFps === 'auto') {
+            this._autoFrameRate = true;
+            this._frameRateTier = 0;
+            this._tierHeadroomStreak = 0;
+            this._maxFrameInterval = 0;
+        } else {
+            this._autoFrameRate = false;
+            this._maxFrameInterval = maxFps > 0 ? 1000 / maxFps : 0;
+        }
+        return this;
+    }
+
+    /**
+     * The current effective frame-rate cap in fps (0 = uncapped). Under
+     * `setMaxFrameRate('auto')` this is the rate the governor has settled on —
+     * external animation loops can read it to pace themselves to the map.
+     */
+    getMaxFrameRate(): number {
+        return this._maxFrameInterval > 0 ? 1000 / this._maxFrameInterval : 0;
+    }
+
+    /**
+     * Render line-only terrain texture stacks at half resolution. Quarters the GPU
+     * memory those stacks hold (so more of the terrain texture cache stays resident
+     * on constrained devices) at the cost of visibly softer draped overlay lines.
+     * Takes effect on the next frame; cached textures re-render automatically.
+     */
+    setLowResLineStacks(on: boolean): this {
+        this._lowResLineStacks = !!on;
+        this.triggerRepaint();
+        return this;
+    }
+
+    _measureRenderedFrame(cpuMs: number) {
+        const gl = this.painter?.context?.gl as WebGL2RenderingContext;
+        if (gl?.fenceSync && !gl.isContextLost()) {
+            const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (sync) {
+                this._pendingGpuFences.push({sync, start: performance.now(), cpu: cpuMs});
+                this._scheduleFencePoll();
+                return;
+            }
+        }
+        // no fence support — govern on main-thread cost alone
+        this._framePerf.push({cpu: cpuMs, gpu: 0});
+    }
+
+    /**
+     * poll pending fences on a fast timer rather than only at animation-frame
+     * callbacks — polling at vsync granularity quantizes every GPU reading up to the
+     * next display tick, which over-reads short frames by up to a whole tick and
+     * makes the governor demote on phantom load
+     */
+    _scheduleFencePoll() {
+        if (this._fencePollTimer != null || !this._pendingGpuFences.length) return;
+        this._fencePollTimer = setTimeout(() => {
+            this._fencePollTimer = null;
+            this._pollGpuFences();
+            this._scheduleFencePoll();
+        }, 1);
+    }
+
+    _pollGpuFences() {
+        if (!this._pendingGpuFences.length) return;
+        const gl = this.painter?.context?.gl as WebGL2RenderingContext;
+        if (!gl || gl.isContextLost()) {
+            this._pendingGpuFences = [];
+            return;
+        }
+        const now = performance.now();
+        const remaining: Map['_pendingGpuFences'] = [];
+        for (const fence of this._pendingGpuFences) {
+            if (gl.getSyncParameter(fence.sync, gl.SYNC_STATUS) === gl.SIGNALED) {
+                gl.deleteSync(fence.sync);
+                this._framePerf.push({cpu: fence.cpu, gpu: now - fence.start});
+            } else if (now - fence.start > 500) {
+                // never-resolving fence (tab occlusion etc.) — drop it
+                gl.deleteSync(fence.sync);
+            } else {
+                remaining.push(fence);
+            }
+        }
+        this._pendingGpuFences = remaining;
+    }
+
+    _maybeAdaptFrameRate() {
+        const WINDOW = 24;              // rendered frames per decision
+        const HEADROOM_STREAK = 4;      // consecutive comfortable windows before speeding up
+        const STEP_UP_COOLDOWN = 10000; // ms after a demotion before promotion is considered
+        if (this._framePerf.length < WINDOW || this._rafDeltas.length < 16) return;
+        // Display refresh interval: median of the 16 smallest observed callback deltas
+        // (callbacks only ever arrive late, so the near-minimum is the true tick; the
+        // median-of-smallest resists single jittered-short outliers), snapped to the
+        // nearest canonical display rate so the ladder doesn't wander frame to frame.
+        const sortedDeltas = [...this._rafDeltas].sort((a, b) => a - b);
+        let vsync = sortedDeltas[8];
+        for (const hz of [240, 165, 144, 120, 90, 75, 60, 50, 30]) {
+            if (Math.abs(vsync - 1000 / hz) < (1000 / hz) * 0.06) {
+                vsync = 1000 / hz;
+                break;
+            }
+        }
+        // ladder of sustainable rates: integer divisors of the display rate, floor ~30fps
+        const divisors: number[] = [];
+        for (let d = 1; 1000 / (vsync * d) >= 29; d++) divisors.push(d);
+        if (!divisors.length) divisors.push(1);
+
+        // Govern on the MEDIAN frame cost — the steady state. Burst frames (a batch of
+        // newly loaded tiles rendering into the terrain texture cache) are heavy but
+        // rate-independent: they happen once per tile at any frame rate, so a lower
+        // tier wouldn't help them and they must not drag the decision.
+        const busy = this._framePerf.map(s => Math.max(s.cpu, s.gpu)).sort((a, b) => a - b);
+        this._framePerf = [];
+        const median = busy[Math.floor(busy.length * 0.5)];
+        const now = performance.now();
+
+        const tier = Math.min(this._frameRateTier, divisors.length - 1);
+        let newTier = tier;
+        if (tier < divisors.length - 1 && median > vsync * divisors[tier] * 1.05) {
+            // typical frames overrun the current budget — step down, and hold the
+            // slower tier for a while: bouncing straight back up feels like a hitch
+            newTier = tier + 1;
+            this._tierHeadroomStreak = 0;
+            this._stepUpBlockedUntil = now + STEP_UP_COOLDOWN;
+        } else if (tier > 0 && median < vsync * divisors[tier - 1] * 0.7) {
+            // comfortable headroom against the next faster tier — step up only after a
+            // sustained streak and outside the post-demotion cooldown, so a workload
+            // that sits between two tiers settles on the lower one instead of flapping
+            if (++this._tierHeadroomStreak >= HEADROOM_STREAK && now >= this._stepUpBlockedUntil) {
+                newTier = tier - 1;
+                this._tierHeadroomStreak = 0;
+            }
+        } else {
+            this._tierHeadroomStreak = 0;
+        }
+
+        if (newTier !== this._frameRateTier) {
+            this._frameRateTier = newTier;
+            this._maxFrameInterval = newTier === 0 ? 0 : vsync * divisors[newTier];
+            this.fire(new Event('framerate', {maxFrameRate: this.getMaxFrameRate(), displayRate: 1000 / vsync}));
         }
     }
 

@@ -120,7 +120,7 @@ export class Tile {
     hasSymbolBuckets: boolean;
     hasRTLText: boolean;
     dependencies: any;
-    rtt: Array<{id: number; stamp: number}>;
+    rtt: Array<{pool: number; id: number; stamp: number} | null>;
     rttFingerprint: {[sourceId:string]: string};
 
     /**
