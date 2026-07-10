@@ -26,6 +26,7 @@ import {type Source} from '../source/source';
 import {type StyleLayer} from '../style/style_layer';
 import {Terrain} from '../render/terrain';
 import {RenderToTexture} from '../webgl/render_to_texture';
+import {glStats, summarizeGlStats, type GlStatsFrame} from '../webgl/gl_stats';
 import {config} from '../util/config';
 import {defaultLocale} from './default_locale';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
@@ -583,9 +584,15 @@ export class Map extends Camera {
     _frameRateTier: number = 0;
     _tierHeadroomStreak: number = 0;
     _stepUpBlockedUntil: number = 0;
-    _framePerf: Array<{cpu: number; gpu: number}> = [];
-    _pendingGpuFences: Array<{sync: WebGLSync; start: number; cpu: number}> = [];
+    _framePerf: Array<{cpu: number; gpu: number; depth: number}> = [];
+    _pendingGpuFences: Array<{sync: WebGLSync; start: number; cpu: number; depth: number}> = [];
+    _lastPromotionTime: number = 0;
     _fencePollTimer: ReturnType<typeof setTimeout> = null;
+    _glStatsEnabled: boolean = false;
+    _glStatsFrames: GlStatsFrame[] = [];
+    _glStatsLastReport: number = 0;
+    _glStatsPerf: Array<{cpu: number; gpu: number; depth: number}> = [];
+    _rttPoolBudgetBytes: number = 0;
     _styleDirty: boolean;
     _sourcesDirty: boolean;
     _placementDirty: boolean;
@@ -3756,6 +3763,8 @@ export class Map extends Camera {
         this._placementDirty = this.style?._updatePlacement(this.transform, this.showCollisionBoxes, fadeDuration, this._crossSourceCollisions, globeRenderingChanged);
 
         // Actually draw
+        if (this._glStatsEnabled) glStats.beginFrame();
+
         this.painter.render(this.style, {
             showTileBoundaries: this.showTileBoundaries,
             showOverdrawInspector: this._showOverdrawInspector,
@@ -3766,6 +3775,8 @@ export class Map extends Camera {
             showPadding: this.showPadding,
             anisotropicFilterPitch: this.getAnisotropicFilterPitch(),
         });
+
+        if (this._glStatsEnabled) this._reportGlStatsFrame();
 
         this.fire(new Event('render'));
 
@@ -3920,8 +3931,13 @@ export class Map extends Camera {
                             throw error;
                         }
                     }
-                    if (this._autoFrameRate) {
+                    // glstats wants the fence measurements even under a fixed cap or
+                    // uncapped — that's how a pinned-rate A/B shows whether the fence
+                    // time is real GPU work or queue latency behind the governed pace
+                    if (this._autoFrameRate || this._glStatsEnabled) {
                         this._measureRenderedFrame(performance.now() - cpuStart);
+                    }
+                    if (this._autoFrameRate) {
                         this._maybeAdaptFrameRate();
                     }
                 },
@@ -3968,6 +3984,84 @@ export class Map extends Camera {
     }
 
     /**
+     * Count the GL calls each rendered frame actually issues (draw calls, uniform
+     * uploads, program switches, texture binds, and the render-to-texture cache
+     * traffic behind them). Renderer dispatch and the GPU process's command decoding
+     * are both roughly linear in these counts, so they are the KPI for draw-call
+     * reduction work. Once per second a `glstats` event fires with the per-frame
+     * median and max over that window.
+     *
+     * Counting sits after the value-dedup checks, so a call that was skipped because
+     * the value didn't change is not counted. Overhead when enabled is a few counter
+     * increments per GL call; zero when disabled.
+     */
+    setGlStats(on: boolean): this {
+        this._glStatsEnabled = !!on;
+        glStats.enabled = this._glStatsEnabled;
+        this._glStatsFrames = [];
+        this._glStatsPerf = [];
+        this._glStatsLastReport = 0;
+        return this;
+    }
+
+    /**
+     * GL call counts for the most recently rendered frame (see {@link Map#setGlStats}),
+     * or null if stats are disabled or nothing has rendered yet.
+     */
+    getGlStats(): GlStatsFrame | null {
+        const frames = this._glStatsFrames;
+        return frames.length ? {...frames[frames.length - 1]} : null;
+    }
+
+    _reportGlStatsFrame() {
+        this._glStatsFrames.push(glStats.endFrame());
+        const timestamp = now();
+        if (this._glStatsLastReport === 0) this._glStatsLastReport = timestamp;
+        if (timestamp - this._glStatsLastReport < 1000) return;
+        const {median, max} = summarizeGlStats(this._glStatsFrames);
+        // frame-cost medians from the governor's fence measurements (only flowing in
+        // setMaxFrameRate('auto') mode) — the numbers the tier decision is made on
+        let framePerf = null;
+        if (this._glStatsPerf.length) {
+            const cpu = this._glStatsPerf.map(s => s.cpu).sort((a, b) => a - b);
+            const gpu = this._glStatsPerf.map(s => s.gpu).sort((a, b) => a - b);
+            const depth = this._glStatsPerf.map(s => s.depth).sort((a, b) => a - b);
+            framePerf = {
+                cpuMs: cpu[cpu.length >> 1],
+                gpuMs: gpu[gpu.length >> 1],
+                cpuMaxMs: cpu[cpu.length - 1],
+                gpuMaxMs: gpu[gpu.length - 1],
+                gpuQueue: depth[depth.length >> 1],
+                gpuQueueMax: depth[depth.length - 1],
+            };
+            this._glStatsPerf = [];
+        }
+        this.fire(new Event('glstats', {
+            frames: this._glStatsFrames.length,
+            median,
+            max,
+            framePerf,
+        }));
+        // keep the last frame so getGlStats stays readable between reports
+        this._glStatsFrames = [this._glStatsFrames[this._glStatsFrames.length - 1]];
+        this._glStatsLastReport = timestamp;
+    }
+
+    /**
+     * Override the byte budget for the terrain render-to-texture pools (0 = default
+     * heuristic). When a frame's (terrain tile × render stack) texture demand exceeds
+     * the budget the pools are scaled down proportionally, and once they can't hold
+     * the working set the cache degrades to re-rendering most stacks every frame —
+     * visible in `glstats` as `rtt tiles rendered` ≈ composites with few cached.
+     * Raising the budget trades GPU memory for eliminating those re-renders.
+     */
+    setRttPoolBudget(megabytes: number): this {
+        this._rttPoolBudgetBytes = Math.max(0, megabytes) * 1024 * 1024;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
      * Render line-only terrain texture stacks at half resolution. Quarters the GPU
      * memory those stacks hold (so more of the terrain texture cache stays resident
      * on constrained devices) at the cost of visibly softer draped overlay lines.
@@ -4008,13 +4102,22 @@ export class Map extends Camera {
         if (gl?.fenceSync && !gl.isContextLost()) {
             const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
             if (sync) {
-                this._pendingGpuFences.push({sync, start: performance.now(), cpu: cpuMs});
+                // depth = this frame's position in the GPU queue at submission
+                // (including itself). A GPU keeping up with the frame rate holds
+                // this at 1–2 (pipelining); a GPU falling behind grows it without
+                // bound — the throughput signal the governor demotes on.
+                this._pendingGpuFences.push({sync, start: performance.now(), cpu: cpuMs, depth: this._pendingGpuFences.length + 1});
                 this._scheduleFencePoll();
                 return;
             }
         }
         // no fence support — govern on main-thread cost alone
-        this._framePerf.push({cpu: cpuMs, gpu: 0});
+        this._framePerf.push({cpu: cpuMs, gpu: 0, depth: 0});
+        if (this._framePerf.length > 256) this._framePerf.shift();
+        if (this._glStatsEnabled) {
+            this._glStatsPerf.push({cpu: cpuMs, gpu: 0, depth: 0});
+            if (this._glStatsPerf.length > 256) this._glStatsPerf.shift();
+        }
     }
 
     /**
@@ -4044,7 +4147,14 @@ export class Map extends Camera {
         for (const fence of this._pendingGpuFences) {
             if (gl.getSyncParameter(fence.sync, gl.SYNC_STATUS) === gl.SIGNALED) {
                 gl.deleteSync(fence.sync);
-                this._framePerf.push({cpu: fence.cpu, gpu: now - fence.start});
+                this._framePerf.push({cpu: fence.cpu, gpu: now - fence.start, depth: fence.depth});
+                // without the governor consuming it (fixed cap + glstats) the window
+                // would grow unboundedly
+                if (this._framePerf.length > 256) this._framePerf.shift();
+                if (this._glStatsEnabled) {
+                    this._glStatsPerf.push({cpu: fence.cpu, gpu: now - fence.start, depth: fence.depth});
+                    if (this._glStatsPerf.length > 256) this._glStatsPerf.shift();
+                }
             } else if (now - fence.start > 500) {
                 // never-resolving fence (tab occlusion etc.) — drop it
                 gl.deleteSync(fence.sync);
@@ -4077,30 +4187,52 @@ export class Map extends Camera {
         for (let d = 1; 1000 / (vsync * d) >= 29; d++) divisors.push(d);
         if (!divisors.length) divisors.push(1);
 
-        // Govern on the MEDIAN frame cost — the steady state. Burst frames (a batch of
-        // newly loaded tiles rendering into the terrain texture cache) are heavy but
+        // Govern on MEDIANS — the steady state. Burst frames (a batch of newly loaded
+        // tiles rendering into the terrain texture cache) are heavy but
         // rate-independent: they happen once per tile at any frame rate, so a lower
         // tier wouldn't help them and they must not drag the decision.
-        const busy = this._framePerf.map(s => Math.max(s.cpu, s.gpu)).sort((a, b) => a - b);
+        //
+        // The GPU fence time is a LATENCY, not a per-frame cost: frames pipeline, so
+        // a sustained 120fps can show ~10ms fence completions (measured) while the
+        // GPU comfortably keeps up. Gating on fence latency therefore can neither
+        // justify a promotion nor detect true overload. Instead:
+        //  - overload = the submission-time GPU queue depth growing (throughput
+        //    signal) or the main thread overrunning the budget
+        //  - promotion = healthy queue (≤1 deep: latency ≈ pure GPU work), that work
+        //    plausibly fitting the faster tier, and main-thread headroom. This is a
+        //    PROBE: if the prediction is wrong, the queue-depth demotion catches it
+        //    within one window, and the extended cooldown stops it flapping.
+        const sortNum = (a: number, b: number) => a - b;
+        const cpus = this._framePerf.map(s => s.cpu).sort(sortNum);
+        const gpus = this._framePerf.map(s => s.gpu).sort(sortNum);
+        const depths = this._framePerf.map(s => s.depth).sort(sortNum);
         this._framePerf = [];
-        const median = busy[Math.floor(busy.length * 0.5)];
+        const cpuMedian = cpus[cpus.length >> 1];
+        const gpuMedian = gpus[gpus.length >> 1];
+        const depthMedian = depths[depths.length >> 1];
         const now = performance.now();
 
         const tier = Math.min(this._frameRateTier, divisors.length - 1);
         let newTier = tier;
-        if (tier < divisors.length - 1 && median > vsync * divisors[tier] * 1.05) {
-            // typical frames overrun the current budget — step down, and hold the
-            // slower tier for a while: bouncing straight back up feels like a hitch
+        if (tier < divisors.length - 1 && (cpuMedian > vsync * divisors[tier] * 1.05 || depthMedian >= 3)) {
+            // main thread overruns the budget, or the GPU queue is backing up —
+            // step down, and hold the slower tier for a while: bouncing straight
+            // back up feels like a hitch. A failed probe (demotion soon after a
+            // promotion) earns a much longer cooldown so the pair can't oscillate.
             newTier = tier + 1;
             this._tierHeadroomStreak = 0;
-            this._stepUpBlockedUntil = now + STEP_UP_COOLDOWN;
-        } else if (tier > 0 && median < vsync * divisors[tier - 1] * 0.7) {
-            // comfortable headroom against the next faster tier — step up only after a
-            // sustained streak and outside the post-demotion cooldown, so a workload
-            // that sits between two tiers settles on the lower one instead of flapping
+            const failedProbe = now - this._lastPromotionTime < 3000;
+            this._stepUpBlockedUntil = now + STEP_UP_COOLDOWN * (failedProbe ? 6 : 1);
+        } else if (tier > 0 &&
+                   cpuMedian < vsync * divisors[tier - 1] * 0.7 &&
+                   depthMedian <= 1 &&
+                   gpuMedian < vsync * divisors[tier - 1] * 1.2) {
+            // step up only after a sustained streak and outside the post-demotion
+            // cooldown, so a workload between two tiers settles low instead of flapping
             if (++this._tierHeadroomStreak >= HEADROOM_STREAK && now >= this._stepUpBlockedUntil) {
                 newTier = tier - 1;
                 this._tierHeadroomStreak = 0;
+                this._lastPromotionTime = now;
             }
         } else {
             this._tierHeadroomStreak = 0;

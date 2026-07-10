@@ -3,6 +3,7 @@ import {type ProgramConfiguration} from '../data/program_configuration';
 import {VertexArrayObject} from './vertex_array_object';
 import {type Context} from './context';
 import {isWebGL2} from './webgl2';
+import {glStats} from './gl_stats';
 
 import type {SegmentVector} from '../data/segment';
 import type {VertexBuffer} from './vertex_buffer';
@@ -186,6 +187,8 @@ export class Program<Us extends UniformBindings> {
 
         if (this.failedToCreate) return;
 
+        if (glStats.enabled) glStats.frame.programDraws++;
+
         context.program.set(this.program);
         context.setDepthMode(depthMode);
         context.setStencilMode(stencilMode);
@@ -194,6 +197,7 @@ export class Program<Us extends UniformBindings> {
 
         // set variables used by the 3d functions defined in _prelude.vertex.glsl
         if (terrain) {
+            if (glStats.enabled) glStats.frame.textureBinds += 2;
             context.activeTexture.set(gl.TEXTURE2);
             gl.bindTexture(gl.TEXTURE_2D, terrain.depthTexture);
             context.activeTexture.set(gl.TEXTURE3);
@@ -248,6 +252,10 @@ export class Program<Us extends UniformBindings> {
                 dynamicLayoutBuffer3
             );
 
+            if (glStats.enabled) {
+                glStats.frame.drawCalls++;
+                if (glStats.inRtt) glStats.frame.rttDrawCalls++;
+            }
             gl.drawElements(
                 drawMode,
                 segment.primitiveLength * primitiveSize,

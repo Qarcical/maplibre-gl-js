@@ -1,5 +1,6 @@
 import {Color} from '@maplibre/maplibre-gl-style-spec';
 import {isWebGL2} from './webgl2';
+import {glStats} from './gl_stats';
 
 import type {Context} from './context';
 import type {
@@ -321,6 +322,7 @@ export class ProgramValue extends BaseValue<WebGLProgram> {
     }
     set(v?: WebGLProgram | null) {
         if (v === this.current && !this.dirty) return;
+        if (glStats.enabled) glStats.frame.programSwitches++;
         this.gl.useProgram(v);
         this.current = v;
         this.dirty = false;
@@ -385,6 +387,7 @@ export class BindTexture extends BaseValue<WebGLTexture> {
     }
     set(v?: WebGLTexture | null) {
         if (v === this.current && !this.dirty) return;
+        if (glStats.enabled) glStats.frame.textureBinds++;
         const gl = this.gl;
         gl.bindTexture(gl.TEXTURE_2D, v);
         this.current = v;

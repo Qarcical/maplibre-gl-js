@@ -43,6 +43,32 @@ describe('render pool', () => {
         expect(recycled.id).toBe(0);
     });
 
+    test('at capacity an object idle since an earlier frame is recycled first, LRU order', () =>  {
+        const pool = createAndFillPool();
+        pool.freeAllObjects();
+        // reuse objects 1 and 2 in the new frame; object 0 stays idle from the old frame
+        pool.beginFrame();
+        pool.useObject(pool.getObjectForId(1));
+        pool.useObject(pool.getObjectForId(2));
+        pool.freeAllObjects();
+        // a churn miss must not evict an entry rendered this frame — the idle object
+        // backs an entry that already fell out of the working set
+        expect(pool.getOrCreateFreeObject().id).toBe(0);
+    });
+
+    test('falls back to MRU when every free object was used this frame', () =>  {
+        const pool = createAndFillPool();
+        pool.freeAllObjects();
+        pool.beginFrame();
+        for (let i = 0; i < POOL_SIZE; i++) {
+            pool.useObject(pool.getObjectForId(i));
+        }
+        pool.freeAllObjects();
+        // true over-subscription: sacrificing the most recently touched entry keeps
+        // a stable resident set
+        expect(pool.getOrCreateFreeObject().id).toBe(POOL_SIZE - 1);
+    });
+
     test('not full after freeing an object', () =>  {
         const pool = createAndFillPool();
         const obj = pool.getObjectForId(0);

@@ -130,14 +130,19 @@ export class TerrainTileManager extends Evented {
      * Free render to texture cache
      * @param tileID - optional, free only corresponding to tileID.
      * @param stacks - optional, free only the given render-stack indices instead of every stack.
+     * @param soft - mark existing entries dirty (stale texture stays drawable, re-render
+     * spreads over frames under the soft budget) instead of dropping them. Use for
+     * content refreshes; layout changes must hard-drop (the stale texture is wrong).
      */
-    freeRtt(tileID?: OverscaledTileID, stacks?: number[]) {
+    freeRtt(tileID?: OverscaledTileID, stacks?: number[], soft?: boolean) {
         for (const key in this._tiles) {
             const tile = this._tiles[key];
             if (!tileID || tile.tileID.equals(tileID) || tile.tileID.isChildOf(tileID) || tileID.isChildOf(tile.tileID)) {
                 if (stacks) {
                     for (const stack of stacks) {
-                        tile.rtt[stack] = null;
+                        const entry = tile.rtt[stack];
+                        if (soft && entry) entry.dirty = true;
+                        else tile.rtt[stack] = null;
                     }
                 } else {
                     tile.rtt = [];

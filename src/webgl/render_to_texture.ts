@@ -5,7 +5,8 @@ import {type OverscaledTileID} from '../tile/tile_id';
 import {drawTerrain} from './draw/draw_terrain';
 import {type Style} from '../style/style';
 import {type Terrain} from '../render/terrain';
-import {RenderPool} from './render_pool';
+import {RenderPool, type PoolObject} from './render_pool';
+import {glStats} from './gl_stats';
 import {type Texture} from './texture';
 import type {StyleLayer} from '../style/style_layer';
 import {ImageSource} from '../source/image_source';
@@ -28,6 +29,15 @@ const LAYERS_TO_TEXTURES: { [keyof in StyleLayer['type']]?: boolean } = {
  * this caps that growth for large tile counts / many stacks.
  */
 const MAX_POOL_BYTES = 512 * 1024 * 1024;
+
+/**
+ * How many soft-invalidated (dirty) stack textures may re-render per frame. A batch of
+ * arriving tiles can dirty 60+ (tile × stack) textures at once; re-rendering them all
+ * in one frame costs several vsyncs of GPU time (observed 20–47ms) and drops presented
+ * frames. Dirty entries keep drawing their stale texture — streaming already shows
+ * coarse content briefly — and refresh a few per frame instead.
+ */
+const SOFT_RERENDERS_PER_FRAME = 6;
 
 function getPoolBudgetBytes(): number {
     // navigator.deviceMemory is Chromium-only and reports at most 8 — treat 8 as
@@ -106,6 +116,10 @@ export class RenderToTexture {
      * drape the changed source, only on terrain tiles overlapping the changed tile.
      */
     _pendingSourceTileChanges: Array<{sourceId: string; tileID?: OverscaledTileID}>;
+    /**
+     * remaining dirty-entry re-renders this frame (see SOFT_RERENDERS_PER_FRAME)
+     */
+    _softRerenderBudget: number;
     constructor(painter: Painter, terrain: Terrain) {
         this.painter = painter;
         this.terrain = terrain;
@@ -114,6 +128,7 @@ export class RenderToTexture {
             new RenderPool(painter.context, 30, terrain.tileManager.tileSize)
         ];
         this._pendingSourceTileChanges = [];
+        this._softRerenderBudget = 0;
     }
 
     destruct() {
@@ -146,6 +161,7 @@ export class RenderToTexture {
     }
 
     prepareForRender(style: Style, zoom: number) {
+        for (const pool of this.pools) pool.beginFrame();
         this._stacks = [];
         this._prevType = null;
         this._rttTiles = [];
@@ -213,24 +229,48 @@ export class RenderToTexture {
             this.terrain.tileManager.freeRtt();
         }
 
-        // apply queued tile-content changes at stack granularity
+        // apply queued tile-content changes at stack granularity. Tile-scoped changes
+        // (streaming tile arrivals) are SOFT — the stale texture stays drawable and
+        // refreshes under the per-frame budget, so an arrival batch can't burst-drop
+        // frames. Source-wide changes (markSourceChanged: per-frame anim uniforms)
+        // stay hard — the anim stack must repaint this frame or the grow head lags —
+        // but only on tiles where the CHANGED SOURCE has content: the stack's other
+        // sources may cover far more tiles (an accumulated reveal/done overlay spans
+        // the whole map by the end of a run), and repainting those every frame made
+        // the per-frame anim cost grow with run progress.
         for (const change of this._pendingSourceTileChanges) {
             const affectedStacks = sourceStackIndices[change.sourceId];
-            if (affectedStacks) this.terrain.tileManager.freeRtt(change.tileID, affectedStacks);
+            if (!affectedStacks) continue;
+            if (change.tileID) {
+                this.terrain.tileManager.freeRtt(change.tileID, affectedStacks, true);
+                continue;
+            }
+            for (const tile of this._renderableTiles) {
+                if (!this._sourceHasContent(change.sourceId, tile)) continue;
+                for (const index of affectedStacks) {
+                    tile.rtt[index] = null;
+                }
+            }
         }
         this._pendingSourceTileChanges = [];
+        this._softRerenderBudget = SOFT_RERENDERS_PER_FRAME;
 
         // check tiles to render
         for (const tile of this._renderableTiles) {
             for (const source in this._rttFingerprints) {
                 // rerender if there are different coords to render than in the last rendering
-                // or if the source revision has changed — but only the stacks draping the source
+                // or if the source revision has changed — but only the stacks draping the
+                // source, and softly: the stale texture keeps drawing until the budgeted
+                // refresh reaches it (the fingerprint stays mismatched, so a deferred
+                // entry is re-marked dirty every frame until it actually re-renders)
                 const fingerprint = this._rttFingerprints[source][tile.tileID.key];
                 if (fingerprint && fingerprint !== tile.rttFingerprint[source]) {
                     const affectedStacks = sourceStackIndices[source];
                     if (affectedStacks) {
                         for (const index of affectedStacks) {
-                            tile.rtt[index] = null;
+                            const entry = tile.rtt[index];
+                            if (entry) entry.dirty = true;
+                            else tile.rtt[index] = null;
                         }
                     }
                 }
@@ -249,9 +289,14 @@ export class RenderToTexture {
             demand[tier] += this._renderableTiles.length;
         }
         const neededBytes = demand[0] * bytesPerObject[0] + demand[1] * bytesPerObject[1];
-        const scale = neededBytes > 0 && Number.isFinite(neededBytes) ? Math.min(1, getPoolBudgetBytes() / neededBytes) : 1;
+        const budgetBytes = style.map._rttPoolBudgetBytes || getPoolBudgetBytes();
+        const scale = neededBytes > 0 && Number.isFinite(neededBytes) ? Math.min(1, budgetBytes / neededBytes) : 1;
         for (let tier = 0; tier < this.pools.length; tier++) {
             this.pools[tier].setSize(Math.max(30, Math.floor(demand[tier] * scale)));
+        }
+        if (glStats.enabled) {
+            glStats.frame.rttPoolSlots = this.pools[0].size + this.pools[1].size;
+            glStats.frame.rttPoolDemand = demand[0] + demand[1];
         }
     }
 
@@ -320,6 +365,12 @@ export class RenderToTexture {
         const layers = this._stacks[stack] || [];
         const tier = this._stackTier(layers, painter.style);
         const pool = this.pools[tier];
+        // A stack opened by an explicit break is DECLARED volatile — its sources
+        // change per frame (animated tracks/reveals), and each per-frame setData
+        // soft-dirties it across every tile the source reloads. Refreshing it must
+        // not consume the soft budget: it's the cheap minimal stack, and letting it
+        // monopolize the budget starves the basemap refreshes the budget exists for.
+        const isVolatileStack = layers.length > 0 && hasRttStackBreak(painter.style._layers[layers[0]]);
         for (const tile of this._renderableTiles) {
             // a tile where no stack layer has anything to draw needs no texture, no
             // pool object and no composite draw (e.g. an animated track's stack only
@@ -336,20 +387,44 @@ export class RenderToTexture {
             }
             this._rttTiles.push(tile);
             // check for cached PoolObject
+            let obj: PoolObject = null;
+            let refreshInPlace = false;
             const cached = tile.rtt[stack];
             if (cached?.pool === tier) {
-                const obj = pool.getObjectForId(cached.id);
-                if (obj.stamp === cached.stamp) {
-                    pool.useObject(obj);
-                    continue;
+                const cachedObj = pool.getObjectForId(cached.id);
+                if (cachedObj.stamp === cached.stamp) {
+                    if (!cached.dirty) {
+                        pool.useObject(cachedObj);
+                        if (glStats.enabled) glStats.frame.rttTilesReused++;
+                        continue;
+                    }
+                    if (!isVolatileStack && this._softRerenderBudget <= 0) {
+                        // budget spent — draw the stale texture this frame; the entry
+                        // stays dirty and refreshes in a later frame
+                        pool.useObject(cachedObj);
+                        if (glStats.enabled) glStats.frame.rttTilesDeferred++;
+                        continue;
+                    }
+                    // refresh in place: same pool object, so no other entry is disturbed
+                    if (!isVolatileStack) this._softRerenderBudget--;
+                    obj = cachedObj;
+                    refreshInPlace = true;
                 }
             }
-            // get free PoolObject
-            const obj = pool.getOrCreateFreeObject();
+            if (!obj) obj = pool.getOrCreateFreeObject();
             pool.useObject(obj);
             pool.stampObject(obj);
             tile.rtt[stack] = {pool: tier, id: obj.id, stamp: obj.stamp};
             // prepare PoolObject for rendering
+            if (glStats.enabled) {
+                glStats.frame.rttTilesRendered++;
+                if (refreshInPlace) glStats.frame.rttTilesRefreshed++;
+                // a surviving cache entry whose pool object was recycled = eviction
+                // (over-subscription); no entry at all = invalidation or first render
+                else if (cached) glStats.frame.rttTilesEvicted++;
+                else glStats.frame.rttTilesInvalidated++;
+                glStats.inRtt = true;
+            }
             painter.context.bindFramebuffer.set(obj.fbo.framebuffer);
             painter.context.clear({color: Color.transparent, stencil: 0});
             painter.currentStencilSource = undefined;
@@ -365,6 +440,7 @@ export class RenderToTexture {
                 painter.renderLayer(painter, painter.style.tileManagers[layer.source], layer, coords, options);
                 if (layer.source) tile.rttFingerprint[layer.source] = this._rttFingerprints[layer.source][tile.tileID.key];
             }
+            glStats.inRtt = false;
         }
         drawTerrain(this.painter, this.terrain, this._rttTiles, options);
         this._rttTiles = [];
@@ -392,6 +468,27 @@ export class RenderToTexture {
             if (layer.type !== 'fill' && layer.type !== 'line') return true;
             // fill/line layers only draw where a covering tile holds a bucket for them
             const tileManager = style.tileManagers[layer.source];
+            for (const coord of coords) {
+                if (tileManager?.getTileByID(coord.key)?.getBucket(layer)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * whether the given source has anything to draw on the given terrain tile —
+     * the invalidation footprint of a source-wide change (markSourceChanged)
+     */
+    _sourceHasContent(sourceId: string, tile: Tile): boolean {
+        const style = this.painter.style;
+        const coords = this._coordsAscending[sourceId]?.[tile.tileID.key];
+        if (!coords?.length) return false;
+        const tileManager = style.tileManagers[sourceId];
+        for (const id of this._renderableLayerIds) {
+            const layer = style._layers[id];
+            if (layer.source !== sourceId || !LAYERS_TO_TEXTURES[layer.type]) continue;
+            // raster / hillshade / color-relief draw wherever a source tile exists
+            if (layer.type !== 'fill' && layer.type !== 'line') return true;
             for (const coord of coords) {
                 if (tileManager?.getTileByID(coord.key)?.getBucket(layer)) return true;
             }

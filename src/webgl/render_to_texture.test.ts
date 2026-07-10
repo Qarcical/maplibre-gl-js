@@ -160,7 +160,7 @@ describe('render to texture', () => {
         );
     });
 
-    test('should clear tile cache when overlaid tiles change', () => {
+    test('should soft-invalidate tile cache when overlaid tiles change', () => {
         rtt.prepareForRender(style, 0);
 
         tile.rttFingerprint = {maine: '923#0'};
@@ -171,7 +171,8 @@ describe('render to texture', () => {
 
         rtt.prepareForRender(style, 0);
 
-        expect(tile.rtt[0]).toBeNull();
+        // the stale texture stays drawable — it refreshes under the per-frame soft budget
+        expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123, dirty: true});
     });
 
     test('should not clear tile cache if state remains same', () => {
@@ -226,7 +227,7 @@ describe('render to texture', () => {
         expect(layersDrawn).toBe(3);
     });
 
-    test('should clear tile cache on source state update', () => {
+    test('should soft-invalidate tile cache on source state update', () => {
         const state = {revision: 0};
         (style.tileManagers['maine'].getState as Mock).mockReturnValue(state);
 
@@ -238,7 +239,7 @@ describe('render to texture', () => {
 
         state.revision = 1;
         rtt.prepareForRender(style, 0);
-        expect(tile.rtt[0]).toBeNull();
+        expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123, dirty: true});
     });
 
     test('metadata stack break renders the prior stack and starts a new one', () => {
@@ -267,9 +268,44 @@ describe('render to texture', () => {
         rtt.prepareForRender(style, 0);
         expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123});
 
-        // a draped source invalidates the stack that drapes it
+        // a draped source soft-invalidates the stack that drapes it: the stale
+        // texture stays drawable and refreshes under the per-frame soft budget
         rtt.markSourceTileChanged('maine', tile.tileID);
         rtt.prepareForRender(style, 0);
+        expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123, dirty: true});
+    });
+
+    test('markSourceChanged hard-drops entries (per-frame anim must repaint this frame)', () => {
+        style._order = ['maine-fill', 'maine-symbol'];
+        (style.tileManagers['maine'].getState as Mock).mockReturnValue({revision: 0});
+        (terrain.tileManager as any)._tiles = {[tile.tileID.key]: tile};
+        rtt.prepareForRender(style, 0);
+
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
+        tile.rttFingerprint = {maine: '923#0'};
+
+        rtt.markSourceChanged('maine');
+        rtt.prepareForRender(style, 0);
         expect(tile.rtt[0]).toBeNull();
+    });
+
+    test('markSourceChanged skips tiles where the changed source has no content', () => {
+        style._order = ['maine-fill', 'maine-symbol'];
+        (style.tileManagers['maine'].getState as Mock).mockReturnValue({revision: 0});
+        (terrain.tileManager as any)._tiles = {[tile.tileID.key]: tile};
+        rtt.prepareForRender(style, 0);
+
+        tile.rtt = [{pool: 0, id: 1, stamp: 123}];
+        tile.rttFingerprint = {maine: '923#0'};
+
+        // the stack drapes the source, but the source has nothing to draw on this
+        // tile — a source-wide change must not repaint it (the invalidation footprint
+        // is the source's content, not the stack's)
+        const buckets = tile.buckets;
+        tile.buckets = {};
+        rtt.markSourceChanged('maine');
+        rtt.prepareForRender(style, 0);
+        tile.buckets = buckets;
+        expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123});
     });
 });

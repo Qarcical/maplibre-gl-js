@@ -120,7 +120,12 @@ export class Tile {
     hasSymbolBuckets: boolean;
     hasRTLText: boolean;
     dependencies: any;
-    rtt: Array<{pool: number; id: number; stamp: number} | null>;
+    /**
+     * cached render-to-texture entries per render stack. `dirty` marks an entry whose
+     * content is stale but still drawable — it re-renders under the per-frame soft
+     * budget instead of immediately (tile-arrival churn must not burst-drop frames)
+     */
+    rtt: Array<{pool: number; id: number; stamp: number; dirty?: boolean} | null>;
     rttFingerprint: {[sourceId:string]: string};
 
     /**

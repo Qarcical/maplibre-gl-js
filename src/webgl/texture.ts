@@ -1,6 +1,7 @@
 import type {Context} from './context';
 import type {RGBAImage, AlphaImage} from '../util/image';
 import {premultiplyAlpha} from '../util/image';
+import {glStats} from './gl_stats';
 
 // PATCH (map2-fork): R32F added for single-channel float DEM textures (heights in metres).
 export type TextureFormat = WebGLRenderingContextBase['RGBA'] | WebGLRenderingContextBase['ALPHA'] | WebGL2RenderingContext['R32F'];
@@ -144,6 +145,7 @@ export class Texture {
             this.texture = this._ownedHandle;
         }
 
+        if (glStats.enabled) glStats.frame.textureBinds++;
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
 
         if (minFilter === gl.LINEAR_MIPMAP_NEAREST && !this.isSizePowerOfTwo()) {

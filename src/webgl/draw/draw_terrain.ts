@@ -6,6 +6,7 @@ import type {Tile} from '../../tile/tile';
 import {CullFaceMode} from '../cull_face_mode';
 import {Color} from '@maplibre/maplibre-gl-style-spec';
 import {ColorMode} from '../color_mode';
+import {glStats} from '../gl_stats';
 import {type Terrain} from '../../render/terrain';
 
 /**
@@ -85,6 +86,10 @@ function drawTerrain(painter: Painter, terrain: Terrain, tiles: Tile[], renderOp
         const mesh = terrain.getTerrainMesh(tile.tileID);
         const texture = painter.renderToTexture.getTexture(tile);
         const terrainData = terrain.getTerrainData(tile.tileID);
+        if (glStats.enabled) {
+            glStats.frame.terrainComposites++;
+            glStats.frame.textureBinds++;
+        }
         context.activeTexture.set(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, texture.texture);
         const eleDelta = terrain.getMeshFrameDelta(tr.zoom);

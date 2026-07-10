@@ -8,6 +8,7 @@ export type PoolObject = {
     texture: Texture;
     stamp: number;
     inUse: boolean;
+    lastUsedFrame: number;
 };
 /**
  * @internal
@@ -28,6 +29,8 @@ export class RenderPool {
      */
     private _sharedDepthStencil: WebGLRenderbuffer;
 
+    private _frame: number = 0;
+
     constructor(
         private readonly _context: Context,
         private _size: number,
@@ -35,6 +38,15 @@ export class RenderPool {
         this._objects = [];
         this._recentlyUsed = [];
         this._stamp = 0;
+    }
+
+    /**
+     * Mark a frame boundary. Eviction distinguishes objects used in the current
+     * frame (backing entries that are certainly still needed) from objects idle
+     * since an earlier frame (backing entries that may have left the working set).
+     */
+    public beginFrame() {
+        this._frame++;
     }
 
     public destruct() {
@@ -53,6 +65,10 @@ export class RenderPool {
         this._size = size;
     }
 
+    public get size(): number {
+        return this._size;
+    }
+
     private _createObject(id: number): PoolObject {
         const fbo = this._context.createFramebuffer(this._tileSize, this._tileSize, true, true);
         const texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA);
@@ -63,7 +79,7 @@ export class RenderPool {
         this._sharedDepthStencil ||= this._context.createRenderbuffer(this._context.gl.DEPTH_STENCIL, this._tileSize, this._tileSize);
         fbo.depthAttachment.set(this._sharedDepthStencil);
         fbo.colorAttachment.set(texture.texture);
-        return {id, fbo, texture, stamp: -1, inUse: false};
+        return {id, fbo, texture, stamp: -1, inUse: false, lastUsedFrame: -1};
     }
 
     public getObjectForId(id: number): PoolObject {
@@ -72,6 +88,7 @@ export class RenderPool {
 
     public useObject(obj: PoolObject) {
         obj.inUse = true;
+        obj.lastUsedFrame = this._frame;
         this._recentlyUsed = this._recentlyUsed.filter(id => obj.id !== id);
         this._recentlyUsed.push(obj.id);
     }
@@ -88,9 +105,22 @@ export class RenderPool {
             this._objects.push(obj);
             return obj;
         }
-        // At capacity, evict the MOST recently used free object. Every cached entry is
-        // touched once per frame in a fixed order, so when demand exceeds capacity an
-        // LRU victim is the entry that will be needed soonest — hit rate collapses to
+        // At capacity, first look for a free object idle since an earlier frame, in
+        // LRU order. When capacity covers the working set, misses come from a trickle
+        // of churn (new tiles, invalidations); an idle object backs an entry that
+        // already fell out of the working set, so the replacement chain terminates.
+        // Evicting the MRU here would sacrifice an entry rendered THIS frame — that
+        // entry then misses and evicts another live one, and the wave saturates the
+        // whole cache (observed as ~90% of stacks re-rendering every frame).
+        for (let i = 0; i < this._recentlyUsed.length; i++) {
+            const obj = this._objects[this._recentlyUsed[i]];
+            if (!obj.inUse && obj.lastUsedFrame !== this._frame)
+                return obj;
+        }
+        // Every free object was already used this frame: true over-subscription
+        // (demand exceeds capacity). Evict the MOST recently used free object —
+        // every cached entry is touched once per frame in a fixed order, so an LRU
+        // victim is the entry that will be needed soonest and hit rate collapses to
         // zero. Sacrificing the most recently touched entry keeps a stable resident
         // set; only (demand - capacity) entries re-render per frame.
         for (let i = this._recentlyUsed.length - 1; i >= 0; i--) {
