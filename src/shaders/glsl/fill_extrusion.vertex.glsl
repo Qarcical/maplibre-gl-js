@@ -16,6 +16,11 @@ in vec4 a_normal_ed;
 
 out vec4 v_color;
 
+// map2 fork: footprint position in tile units, tested against u_clip_rect in the
+// fragment shader so extruded buildings are clipped to the challenge plate window
+// (extrusions draw ABOVE draped masks in 3D, so the drape alone can't hide them).
+out vec2 v_clip_pos;
+
 #pragma mapbox: define highp float base
 #pragma mapbox: define highp float height
 
@@ -47,6 +52,7 @@ void main() {
     float t = mod(normal.x, 2.0);
     float elevation = t > 0.0 ? height : base;
     vec2 posInTile = a_pos + u_fill_translate;
+    v_clip_pos = posInTile;
 
     #ifdef GLOBE
         vec3 spherePos = projectToSphere(posInTile, a_pos);

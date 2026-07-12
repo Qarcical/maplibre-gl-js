@@ -119,6 +119,9 @@ export class Painter {
     currentStencilSource: string;
     nextStencilID: number;
     id: string;
+    // map2 fork: axis-aligned mercator [0..1] window that fill-extrusion fragments are
+    // clipped to (challenge plate mask). null = no clip. Set via map.setExtrusionClipRect.
+    extrusionClipRect: {minX: number; minY: number; maxX: number; maxY: number} | null;
     _showOverdrawInspector: boolean;
     cache: {[_: string]: Program<any>};
     crossTileSymbolIndex: CrossTileSymbolIndex;
@@ -135,6 +138,7 @@ export class Painter {
         this.context = new Context(gl);
         this.transform = transform;
         this._tileTextures = {};
+        this.extrusionClipRect = null;
         this.terrainFacilitator = {depthDirty: true, coordsDirty: false, matrix: mat4.identity(new Float64Array(16) as any), renderTime: 0};
 
         this.setup();

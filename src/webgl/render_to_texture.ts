@@ -116,7 +116,7 @@ export class RenderToTexture {
      * tiles). Processed in prepareForRender: each entry re-renders only the stacks that
      * drape the changed source, only on terrain tiles overlapping the changed tile.
      */
-    _pendingSourceTileChanges: Array<{sourceId: string; tileID?: OverscaledTileID}>;
+    _pendingSourceTileChanges: Array<{sourceId: string; tileID?: OverscaledTileID; soft?: boolean}>;
     /**
      * remaining dirty-entry re-renders this frame (see SOFT_RERENDERS_PER_FRAME)
      */
@@ -159,6 +159,19 @@ export class RenderToTexture {
      */
     markSourceChanged(sourceId: string) {
         this._pendingSourceTileChanges.push({sourceId});
+    }
+
+    /**
+     * Soft twin of markSourceChanged: the source's rendering changed everywhere (e.g. a
+     * global-state input of a paint expression, like the 2D↔3D "3d-blend" fade), but the
+     * stale texture is fine to keep drawing until the budgeted refresh reaches it. Entries
+     * are marked dirty (re-rendered in place under SOFT_RERENDERS_PER_FRAME) instead of
+     * dropped, so a per-frame fade re-renders the affected stacks round-robin without
+     * burst-dropping frames. Style._applyGlobalStateChanges calls this automatically for
+     * every source whose layers' paint reads a changed global-state property.
+     */
+    markSourceChangedSoft(sourceId: string) {
+        this._pendingSourceTileChanges.push({sourceId, soft: true});
     }
 
     prepareForRender(style: Style, zoom: number) {
@@ -210,7 +223,9 @@ export class RenderToTexture {
                 if (!prevIsRtt || hasRttStackBreak(layer)) stacks.push([]);
                 stacks[stacks.length - 1].push(id);
                 prevIsRtt = true;
-            } else {
+            } else if (layer.type !== 'fill-extrusion') {
+                // fill-extrusions don't break the draped run (see renderLayer) — leave
+                // prevIsRtt set so the drapes on both sides stay in one stack
                 prevIsRtt = false;
             }
         }
@@ -228,6 +243,13 @@ export class RenderToTexture {
         if (signature !== this._stacksSignature) {
             this._stacksSignature = signature;
             this.terrain.tileManager.freeRtt();
+            if (glStats.enabled) {
+                // The stack audit's raw data, once per layout change (style edit,
+                // zoom visibility flip, 2D↔3D): each stack is one composite pass
+                // per terrain tile per frame plus one pool texture per tile.
+                console.log(`[rtt] ${stacks.length} stack(s):\n${
+                    stacks.map((s, i) => `  ${i} [tier ${this._stackTier(s, style)}] ${s.join(', ')}`).join('\n')}`);
+            }
         }
 
         // apply queued tile-content changes at stack granularity. Tile-scoped changes
@@ -249,7 +271,14 @@ export class RenderToTexture {
             for (const tile of this._renderableTiles) {
                 if (!this._sourceHasContent(change.sourceId, tile)) continue;
                 for (const index of affectedStacks) {
-                    tile.rtt[index] = null;
+                    if (change.soft) {
+                        // soft: keep drawing the stale texture, refresh under the budget
+                        const entry = tile.rtt[index];
+                        if (entry) entry.dirty = true;
+                        else tile.rtt[index] = null;
+                    } else {
+                        tile.rtt[index] = null;
+                    }
                 }
             }
         }
@@ -328,6 +357,24 @@ export class RenderToTexture {
         const options: RenderOptions = {...renderOptions, isRenderingToTexture: true};
         const type = layer.type;
         const isLastLayer = this._renderableLayerIds[this._renderableLayerIds.length - 1] === layer.id;
+
+        // A fill-extrusion is live 3D geometry standing ABOVE the terrain surface. A draped
+        // layer is that surface's texture, so it can never paint onto the extrusion — the
+        // depth test keeps the building in front of any later drape composite — which makes
+        // draped paint order AROUND an extrusion visually meaningless on terrain. So it need
+        // not split the draped run into a separate stack: draw it live in place but leave
+        // _prevType and the open stack untouched, and the drapes on both sides merge into ONE
+        // stack + texture. This is mirrored in the stack-signature builder in prepareForRender
+        // (the two must agree or stack invalidation desyncs from what actually rendered).
+        // Exception: when it's the last renderable layer there's no following drape to merge
+        // with and the pending stack still needs compositing, so fall through to the normal
+        // path. NB the merged stack composites AFTER the building has drawn — correct for
+        // opaque buildings (depth protects them, exactly as they already survive a later
+        // stack's composite today); a translucent extrusion mid-zoom-fade would blend against
+        // pre-stack content instead of the merged ground (accepted — opaque at follow-cam zoom).
+        if (type === 'fill-extrusion' && !isLastLayer) {
+            return false;
+        }
 
         // remember background, fill, line & raster layer to render into a stack
         if (LAYERS_TO_TEXTURES[type]) {

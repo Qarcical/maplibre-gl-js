@@ -14,5 +14,6 @@ export interface IRenderToTexture {
     getTexture(tile: Tile): any;
     markSourceTileChanged(sourceId: string, tileID: OverscaledTileID): void;
     markSourceChanged(sourceId: string): void;
+    markSourceChangedSoft(sourceId: string): void;
     destruct(): void;
 }

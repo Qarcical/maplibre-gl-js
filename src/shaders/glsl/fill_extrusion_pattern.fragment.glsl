@@ -7,6 +7,10 @@ in vec2 v_pos_a;
 in vec2 v_pos_b;
 in vec4 v_lighting;
 
+// map2 fork: clip extruded buildings to the challenge plate window (see fill_extrusion.fragment.glsl).
+uniform vec4 u_clip_rect;
+in vec2 v_clip_pos;
+
 #pragma mapbox: define lowp float base
 #pragma mapbox: define lowp float height
 #pragma mapbox: define lowp vec4 pattern_from
@@ -15,6 +19,11 @@ in vec4 v_lighting;
 #pragma mapbox: define lowp float pixel_ratio_to
 
 void main() {
+    if (v_clip_pos.x < u_clip_rect.x || v_clip_pos.y < u_clip_rect.y ||
+        v_clip_pos.x > u_clip_rect.z || v_clip_pos.y > u_clip_rect.w) {
+        discard;
+    }
+
     #pragma mapbox: initialize lowp float base
     #pragma mapbox: initialize lowp float height
     #pragma mapbox: initialize mediump vec4 pattern_from

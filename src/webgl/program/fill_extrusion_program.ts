@@ -3,11 +3,13 @@ import {
     Uniform1i,
     Uniform1f,
     Uniform2f,
-    Uniform3f
+    Uniform3f,
+    Uniform4f
 } from '../uniform_binding';
 
 import {mat3, vec3} from 'gl-matrix';
 import {extend} from '../../util/util';
+import {EXTENT} from '../../data/extent';
 
 import type {Context} from '../../webgl/context';
 import type {Painter} from '../../render/painter';
@@ -24,6 +26,7 @@ export type FillExtrusionUniformsType = {
     'u_vertical_gradient': Uniform1f;
     'u_opacity': Uniform1f;
     'u_fill_translate': Uniform2f;
+    'u_clip_rect': Uniform4f;
 };
 
 export type FillExtrusionPatternUniformsType = {
@@ -35,6 +38,7 @@ export type FillExtrusionPatternUniformsType = {
     'u_vertical_gradient': Uniform1f;
     'u_opacity': Uniform1f;
     'u_fill_translate': Uniform2f;
+    'u_clip_rect': Uniform4f;
     // pattern uniforms:
     'u_texsize': Uniform2f;
     'u_image': Uniform1i;
@@ -52,6 +56,7 @@ const fillExtrusionUniforms = (context: Context, locations: UniformLocations): F
     'u_vertical_gradient': new Uniform1f(context, locations.u_vertical_gradient),
     'u_opacity': new Uniform1f(context, locations.u_opacity),
     'u_fill_translate': new Uniform2f(context, locations.u_fill_translate),
+    'u_clip_rect': new Uniform4f(context, locations.u_clip_rect),
 });
 
 const fillExtrusionPatternUniforms = (context: Context, locations: UniformLocations): FillExtrusionPatternUniformsType => ({
@@ -63,6 +68,7 @@ const fillExtrusionPatternUniforms = (context: Context, locations: UniformLocati
     'u_height_factor': new Uniform1f(context, locations.u_height_factor),
     'u_opacity': new Uniform1f(context, locations.u_opacity),
     'u_fill_translate': new Uniform2f(context, locations.u_fill_translate),
+    'u_clip_rect': new Uniform4f(context, locations.u_clip_rect),
     // pattern uniforms
     'u_image': new Uniform1i(context, locations.u_image),
     'u_texsize': new Uniform2f(context, locations.u_texsize),
@@ -72,11 +78,34 @@ const fillExtrusionPatternUniforms = (context: Context, locations: UniformLocati
     'u_fade': new Uniform1f(context, locations.u_fade)
 });
 
+// map2 fork: the painter's plate-window clip rect (mercator [0..1]) expressed in the
+// tile's local a_pos units (0..EXTENT), as [minX, minY, maxX, maxY]. When no clip is
+// set, returns a huge rect so the fragment test never discards. web-mercator keeps the
+// lng/lat window axis-aligned, so an AABB test in tile space is exact.
+const extrusionClipRectForTile = (
+    painter: Painter,
+    coord: OverscaledTileID
+): [number, number, number, number] => {
+    const clip = painter.extrusionClipRect;
+    if (!clip) {
+        return [-1e9, -1e9, 1e9, 1e9];
+    }
+    const {x, y, z} = coord.canonical;
+    const scale = Math.pow(2, z);
+    return [
+        (clip.minX * scale - x) * EXTENT,
+        (clip.minY * scale - y) * EXTENT,
+        (clip.maxX * scale - x) * EXTENT,
+        (clip.maxY * scale - y) * EXTENT,
+    ];
+};
+
 const fillExtrusionUniformValues = (
     painter: Painter,
     shouldUseVerticalGradient: boolean,
     opacity: number,
     translate: [number, number],
+    coord: OverscaledTileID,
 ): UniformValues<FillExtrusionUniformsType> => {
     const light = painter.style.light;
     const _lp = light.properties.get('position');
@@ -98,6 +127,7 @@ const fillExtrusionUniformValues = (
         'u_vertical_gradient': +shouldUseVerticalGradient,
         'u_opacity': opacity,
         'u_fill_translate': translate,
+        'u_clip_rect': extrusionClipRectForTile(painter, coord),
     };
 };
 
@@ -110,7 +140,7 @@ const fillExtrusionPatternUniformValues = (
     crossfade: CrossfadeParameters,
     tile: Tile
 ): UniformValues<FillExtrusionPatternUniformsType> => {
-    return extend(fillExtrusionUniformValues(painter, shouldUseVerticalGradient, opacity, translate),
+    return extend(fillExtrusionUniformValues(painter, shouldUseVerticalGradient, opacity, translate, coord),
         patternUniformValues(crossfade, painter, tile),
         {
             'u_height_factor': -Math.pow(2, coord.overscaledZ) / tile.tileSize / 8

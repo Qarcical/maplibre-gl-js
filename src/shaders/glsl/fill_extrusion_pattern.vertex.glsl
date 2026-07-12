@@ -26,6 +26,9 @@ out vec2 v_pos_a;
 out vec2 v_pos_b;
 out vec4 v_lighting;
 
+// map2 fork: footprint position for the plate-window clip (see fill_extrusion.*.glsl).
+out vec2 v_clip_pos;
+
 #pragma mapbox: define lowp float base
 #pragma mapbox: define lowp float height
 #pragma mapbox: define lowp vec4 pattern_from
@@ -75,6 +78,7 @@ void main() {
     float t = mod(normal.x, 2.0);
     float elevation = t > 0.0 ? height : base;
     vec2 posInTile = a_pos + u_fill_translate;
+    v_clip_pos = posInTile;
 
     #ifdef GLOBE
         vec3 spherePos = projectToSphere(posInTile, a_pos);

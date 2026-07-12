@@ -384,6 +384,7 @@ export class Style extends Evented {
         }
 
         const sourceIdsToReload = new Set<string>();
+        const paintChangedSourceIds = new Set<string>();
         const globalStateChange = {};
 
         for (const ref of globalStateRefs) {
@@ -402,6 +403,9 @@ export class Style extends Evented {
                     for (const {name, value} of paintAffectingGlobalStateRefs.get(ref)) {
                         this._updatePaintProperty(layer, name, value);
                     }
+                    if (layer.source) {
+                        paintChangedSourceIds.add(layer.source);
+                    }
                 }
                 if (visibilityAffectingGlobalStateRefs?.has(ref)) {
                     layer.recalculateVisibility();
@@ -417,6 +421,21 @@ export class Style extends Evented {
             if (sourceIdsToReload.has(id)) {
                 this._reloadSource(id);
                 this._changed = true;
+            }
+        }
+
+        // Draped (terrain RTT) layers render from cached stack textures, which don't see
+        // paint re-evaluations — a global-state-driven fade (e.g. the 2D↔3D "3d-blend")
+        // would be invisible in 3D without a refresh. Soft: the stale texture keeps
+        // drawing while dirty entries re-render under the per-frame budget, so a
+        // per-frame fade can't burst-drop frames. Sources already being reloaded get
+        // hard-invalidated through their tile events anyway.
+        const renderToTexture = this.map.painter?.renderToTexture;
+        if (renderToTexture) {
+            for (const id of paintChangedSourceIds) {
+                if (!sourceIdsToReload.has(id)) {
+                    renderToTexture.markSourceChangedSoft(id);
+                }
             }
         }
     }

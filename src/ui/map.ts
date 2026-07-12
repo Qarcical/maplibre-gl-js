@@ -14,6 +14,7 @@ import {HandlerManager} from './handler_manager';
 import {Camera, type CameraOptions, type CameraUpdateTransformFunction, type FitBoundsOptions} from './camera';
 import {LngLat} from '../geo/lng_lat';
 import {LngLatBounds} from '../geo/lng_lat_bounds';
+import {MercatorCoordinate} from '../geo/mercator_coordinate';
 import Point from '@mapbox/point-geometry';
 import {AttributionControl, type AttributionControlOptions, defaultAttributionControlOptions} from './control/attribution_control';
 import {LogoControl} from './control/logo_control';
@@ -4092,6 +4093,30 @@ export class Map extends Camera {
         // source's stacks dirty so the clip change is visible in 3D
         if (layer.source && this.painter?.renderToTexture) {
             this.painter.renderToTexture.markSourceChanged(layer.source);
+        }
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: clip all `fill-extrusion` layers to a lng/lat window, discarding
+     * extruded fragments outside it in the fragment shader. Used by the challenge
+     * exports so extruded buildings don't poke through the draped plate mask in 3D
+     * (extrusions render ABOVE drapes, so the mask alone can't hide them). The window
+     * is a lng/lat rectangle — axis-aligned in web-mercator, so the clip is exact.
+     * Pass null to disable.
+     */
+    setExtrusionClipRect(bounds: LngLatBoundsLike | null): this {
+        if (!this.painter) return this;
+        if (!bounds) {
+            this.painter.extrusionClipRect = null;
+        } else {
+            const b = LngLatBounds.convert(bounds);
+            // MercatorCoordinate y grows southward, matching tile a_pos.y — so
+            // north edge → minY, south edge → maxY.
+            const nw = MercatorCoordinate.fromLngLat(b.getNorthWest());
+            const se = MercatorCoordinate.fromLngLat(b.getSouthEast());
+            this.painter.extrusionClipRect = {minX: nw.x, minY: nw.y, maxX: se.x, maxY: se.y};
         }
         this.triggerRepaint();
         return this;

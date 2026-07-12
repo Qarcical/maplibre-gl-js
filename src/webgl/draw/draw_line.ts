@@ -1,3 +1,4 @@
+import {Color} from '@maplibre/maplibre-gl-style-spec';
 import {DepthMode} from '../depth_mode';
 import {CullFaceMode} from '../cull_face_mode';
 import {Texture} from '../texture';
@@ -147,15 +148,23 @@ export function drawLine(painter: Painter, tileManager: TileManager, layer: Line
     const width = layer.paint.get('line-width');
     if (opacity.constantOr(1) === 0 || width.constantOr(1) === 0) return;
 
-    const depthMode = painter.getDepthModeForSublayer(0, DepthMode.ReadOnly);
-    const colorMode = painter.colorModeForRenderPass();
-
     const dasharrayProperty = layer.paint.get('line-dasharray');
     const dasharray = dasharrayProperty.constantOr(1 as any);
     const patternProperty = layer.paint.get('line-pattern');
     const image = patternProperty.constantOr(1 as any);
 
     const gradient = layer.paint.get('line-gradient');
+
+    // map2 fork: a constant line-color with alpha 0 draws nothing — skip the layer, in live
+    // AND RTT rendering. This is what makes a global-state fade-to-transparent (the 2D↔3D
+    // "3d-blend" on contours, faded via color alpha because their line-opacity is data-driven)
+    // actually FREE once fully faded: without it every RTT re-render of the stack keeps
+    // rasterising the invisible lines. Pattern/gradient lines don't read line-color, and a
+    // data-driven color returns the (opaque) fallback, so neither can be skipped wrongly.
+    if (!image && !gradient && layer.paint.get('line-color').constantOr(Color.black).a === 0) return;
+
+    const depthMode = painter.getDepthModeForSublayer(0, DepthMode.ReadOnly);
+    const colorMode = painter.colorModeForRenderPass();
     const crossfade = layer.getCrossfadeParameters();
 
     let programId: string;
