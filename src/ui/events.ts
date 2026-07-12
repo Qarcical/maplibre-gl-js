@@ -518,8 +518,20 @@ export class MapMouseEvent extends Event implements MapLibreEvent<MouseEvent> {
 
     /**
      * The geographic location on the map of the mouse cursor.
+     *
+     * map2-fork: computed lazily on first access. With terrain active, unprojecting a
+     * screen point re-renders the coords/depth framebuffers and does a synchronous
+     * gl.readPixels; doing that eagerly in the constructor stalled the GPU pipeline on
+     * every mouse event, whether or not anything read the coordinate.
      */
-    lngLat: LngLat;
+    get lngLat(): LngLat {
+        this._lngLat ??= this.target.unproject(this.point);
+        return this._lngLat;
+    }
+    set lngLat(v: LngLat) {
+        this._lngLat = v;
+    }
+    _lngLat: LngLat;
 
     /**
      * Prevents subsequent default processing of the event by the map.
@@ -548,8 +560,7 @@ export class MapMouseEvent extends Event implements MapLibreEvent<MouseEvent> {
     constructor(type: string, map: Map, originalEvent: MouseEvent, data: any = {}) {
         originalEvent = originalEvent instanceof MouseEvent ? originalEvent : new MouseEvent(type, originalEvent);
         const point = DOM.mousePos(map.getCanvas(), originalEvent);
-        const lngLat = map.unproject(point);
-        super(type, extend({point, lngLat, originalEvent}, data));
+        super(type, extend({point, originalEvent}, data));
         this._defaultPrevented = false;
         this.target = map;
     }
@@ -578,8 +589,19 @@ export class MapTouchEvent extends Event implements MapLibreEvent<TouchEvent> {
 
     /**
      * The geographic location on the map of the center of the touch event points.
+     *
+     * map2-fork: computed lazily on first access (see MapMouseEvent.lngLat — with
+     * terrain each unproject is a framebuffer render + synchronous readback, and touch
+     * events used to pay it once per touch point per event).
      */
-    lngLat: LngLat;
+    get lngLat(): LngLat {
+        this._lngLat ??= this.target.unproject(this.point);
+        return this._lngLat;
+    }
+    set lngLat(v: LngLat) {
+        this._lngLat = v;
+    }
+    _lngLat: LngLat;
 
     /**
      * The pixel coordinates of the center of the touch event points, relative to the map and measured from the top left
@@ -596,8 +618,17 @@ export class MapTouchEvent extends Event implements MapLibreEvent<TouchEvent> {
     /**
      * The geographical locations on the map corresponding to a
      * [touch event's `touches`](https://developer.mozilla.org/en-US/docs/Web/API/TouchEvent/touches) property.
+     *
+     * map2-fork: computed lazily on first access, one unproject per touch point.
      */
-    lngLats: LngLat[];
+    get lngLats(): LngLat[] {
+        this._lngLats ??= this.points.map((t) => this.target.unproject(t));
+        return this._lngLats;
+    }
+    set lngLats(v: LngLat[]) {
+        this._lngLats = v;
+    }
+    _lngLats: LngLat[];
 
     /**
      * Prevents subsequent default processing of the event by the map.
@@ -624,13 +655,12 @@ export class MapTouchEvent extends Event implements MapLibreEvent<TouchEvent> {
     constructor(type: string, map: Map, originalEvent: TouchEvent) {
         const touches = type === 'touchend' ? originalEvent.changedTouches : originalEvent.touches;
         const points = DOM.touchPos(map.getCanvasContainer(), touches);
-        const lngLats = points.map((t) => map.unproject(t));
         const point = points.reduce((prev, curr, i, arr) => {
             return prev.add(curr.div(arr.length));
         }, new Point(0, 0));
-        const lngLat = map.unproject(point);
-        super(type, {points, point, lngLats, lngLat, originalEvent});
+        super(type, {points, point, originalEvent});
         this._defaultPrevented = false;
+        this.target = map;
     }
 }
 

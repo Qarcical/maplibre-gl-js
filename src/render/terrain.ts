@@ -383,6 +383,18 @@ export class Terrain {
     }
 
     /**
+     * map2-fork: pointCoordinate readback memo. gl.readPixels is a synchronous GPU→CPU
+     * round trip that drains the pipelined frame queue, and pointer events trigger one
+     * per event (MapMouseEvent lngLat, queryRenderedFeatures, elevation lookups). The
+     * result for a given screen pixel only changes when the coords framebuffer is
+     * re-rendered, so cache per (coordsVersion, pixel): a static camera pays zero
+     * readbacks for repeated queries, and multiple queries of the same point within a
+     * frame share one.
+     */
+    _pointCoordinateCache = new Map<number, MercatorCoordinate>();
+    _pointCoordinateCacheVersion = -1;
+
+    /**
      * Reads a pixel from the coords-framebuffer and translate this to mercator, or null, if the pixel doesn't lie on the terrain's surface (but the sky instead).
      * @param p - Screen-Coordinate
      * @returns Mercator coordinate for a screen pixel, or null, if the pixel is not covered by terrain (is in the sky).
@@ -392,10 +404,21 @@ export class Terrain {
         this.painter.maybeDrawDepth(true);
         this.painter.maybeDrawCoords();
 
-        const rgba = new Uint8Array(4);
-        const context = this.painter.context, gl = context.gl;
         const px = Math.round(p.x * this.painter.pixelRatio / devicePixelRatio);
         const py = Math.round(p.y * this.painter.pixelRatio / devicePixelRatio);
+
+        const version = this.painter.terrainFacilitator?.coordsVersion ?? 0;
+        if (version !== this._pointCoordinateCacheVersion) {
+            this._pointCoordinateCache.clear();
+            this._pointCoordinateCacheVersion = version;
+        }
+        const cacheKey = py * 65536 + px;
+        if (this._pointCoordinateCache.has(cacheKey)) {
+            return this._pointCoordinateCache.get(cacheKey);
+        }
+
+        const rgba = new Uint8Array(4);
+        const context = this.painter.context, gl = context.gl;
         const fbHeight = Math.round(this.painter.height / devicePixelRatio);
         // grab coordinate pixel from coordinates framebuffer
         context.bindFramebuffer.set(this.getFramebuffer('coords').framebuffer);
@@ -407,17 +430,21 @@ export class Terrain {
         const tileID = this.coordsIndex[255 - rgba[3]];
         const tile = tileID && this.tileManager.getTileByID(tileID);
 
-        if (!tile) {
-            return null;
+        let result: MercatorCoordinate = null;
+        if (tile) {
+            const coordsSize = this._coordsTextureSize;
+            const worldSize = (1 << tile.tileID.canonical.z) * coordsSize;
+            result = new MercatorCoordinate(
+                (tile.tileID.canonical.x * coordsSize + x) / worldSize + tile.tileID.wrap,
+                (tile.tileID.canonical.y * coordsSize + y) / worldSize,
+                this.getElevation(tile.tileID, x, y, coordsSize)
+            );
         }
-
-        const coordsSize = this._coordsTextureSize;
-        const worldSize = (1 << tile.tileID.canonical.z) * coordsSize;
-        return new MercatorCoordinate(
-            (tile.tileID.canonical.x * coordsSize + x) / worldSize + tile.tileID.wrap,
-            (tile.tileID.canonical.y * coordsSize + y) / worldSize,
-            this.getElevation(tile.tileID, x, y, coordsSize)
-        );
+        if (this._pointCoordinateCache.size >= 64) {
+            this._pointCoordinateCache.clear();
+        }
+        this._pointCoordinateCache.set(cacheKey, result);
+        return result;
     }
 
     /**

@@ -131,7 +131,7 @@ export class Painter {
     // this object stores the current camera-matrix and the last render time
     // of the terrain-facilitators. e.g. depth & coords framebuffers
     // every time the camera-matrix changes the terrain-facilitators will be redrawn.
-    terrainFacilitator: {depthDirty: boolean; coordsDirty: boolean; matrix: mat4; renderTime: number};
+    terrainFacilitator: {depthDirty: boolean; coordsDirty: boolean; matrix: mat4; renderTime: number; coordsVersion: number};
 
     constructor(gl: WebGLRenderingContext | WebGL2RenderingContext, transform: IReadonlyTransform) {
         this.drawFunctions = webglDrawFunctions;
@@ -139,7 +139,7 @@ export class Painter {
         this.transform = transform;
         this._tileTextures = {};
         this.extrusionClipRect = null;
-        this.terrainFacilitator = {depthDirty: true, coordsDirty: false, matrix: mat4.identity(new Float64Array(16) as any), renderTime: 0};
+        this.terrainFacilitator = {depthDirty: true, coordsDirty: false, matrix: mat4.identity(new Float64Array(16) as any), renderTime: 0, coordsVersion: 0};
 
         this.setup();
 
@@ -674,6 +674,9 @@ export class Painter {
             return;
         }
         this.terrainFacilitator.coordsDirty = false;
+        // map2-fork: version-stamp each coords render so pointCoordinate can memoize
+        // its readPixels results for as long as the framebuffer content is unchanged.
+        this.terrainFacilitator.coordsVersion++;
         this.drawFunctions.terrainCoords(this, this.style.map.terrain);
     }
 
