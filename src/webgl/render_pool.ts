@@ -1,4 +1,5 @@
 import {Texture} from './texture';
+import {glStats} from './gl_stats';
 import {type Context} from './context';
 import {type Framebuffer} from './framebuffer';
 
@@ -14,6 +15,17 @@ export type PoolObject = {
  * @internal
  * `RenderPool` is a resource pool for textures and framebuffers
  */
+/**
+ * map2 fork: a holder of pre-allocated / preserved framebuffer+texture pairs (the
+ * painter). Pool object creation measured 8–99ms EACH on Adreno — the dominant cost
+ * of the first terrain frame — so objects are allocated ahead of time during idle 2D
+ * and returned here on terrain uninstall instead of being destroyed.
+ */
+export type PoolObjectStash = {
+    takePoolStash(size: number): {fbo: Framebuffer; texture: Texture} | null;
+    stashPoolObject(size: number, fbo: Framebuffer, texture: Texture): boolean;
+};
+
 export class RenderPool {
     private _objects: PoolObject[];
     /**
@@ -34,7 +46,8 @@ export class RenderPool {
     constructor(
         private readonly _context: Context,
         private _size: number,
-        private readonly _tileSize: number) {
+        private readonly _tileSize: number,
+        private readonly _stash?: PoolObjectStash) {
         this._objects = [];
         this._recentlyUsed = [];
         this._stamp = 0;
@@ -51,6 +64,9 @@ export class RenderPool {
 
     public destruct() {
         for (const obj of this._objects) {
+            // map2 fork: keep the GPU resources for the next terrain install — every
+            // 2D↔3D round trip otherwise re-pays the whole allocation burst
+            if (this._stash?.stashPoolObject?.(this._tileSize, obj.fbo, obj.texture)) continue;
             obj.texture.destroy();
             obj.fbo.destroy();
         }
@@ -70,15 +86,37 @@ export class RenderPool {
     }
 
     private _createObject(id: number): PoolObject {
-        const fbo = this._context.createFramebuffer(this._tileSize, this._tileSize, true, true);
-        const texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA);
-        texture.bind(this._context.gl.LINEAR, this._context.gl.CLAMP_TO_EDGE);
-        if (this._context.extTextureFilterAnisotropic) {
-            this._context.gl.texParameterf(this._context.gl.TEXTURE_2D, this._context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this._context.extTextureFilterAnisotropicMax);
+        // map2 fork: time pool-object creation — the first terrain frame grows the pool
+        // from zero to the whole working set (~40–60 framebuffer+texture pairs at
+        // 4–16MB each), the remaining suspect for the ~330ms first-terrain stall on
+        // Adreno now that compiles and uploads are instrumented and cleared.
+        const allocStart = performance.now();
+        // adopt a pre-allocated pair when available (idle-time prewarm / previous
+        // terrain install) — attachment rewiring below is cheap; the allocation isn't
+        const stashed = this._stash?.takePoolStash?.(this._tileSize);   // defensive: tests mock the painter
+        let fbo: Framebuffer;
+        let texture: Texture;
+        if (stashed) {
+            ({fbo, texture} = stashed);
+        } else {
+            fbo = this._context.createFramebuffer(this._tileSize, this._tileSize, true, true);
+            texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA);
+            texture.bind(this._context.gl.LINEAR, this._context.gl.CLAMP_TO_EDGE);
+            if (this._context.extTextureFilterAnisotropic) {
+                this._context.gl.texParameterf(this._context.gl.TEXTURE_2D, this._context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this._context.extTextureFilterAnisotropicMax);
+            }
         }
         this._sharedDepthStencil ||= this._context.createRenderbuffer(this._context.gl.DEPTH_STENCIL, this._tileSize, this._tileSize);
         fbo.depthAttachment.set(this._sharedDepthStencil);
         fbo.colorAttachment.set(texture.texture);
+        if (glStats.enabled) {
+            const allocMs = performance.now() - allocStart;
+            glStats.frame.poolAllocs++;
+            glStats.frame.poolAllocMs += allocMs;
+            if (allocMs > 8) {
+                console.log(`[map2-fork] slow pool alloc: ${this._tileSize}px object ${id} ${allocMs.toFixed(1)}ms`);
+            }
+        }
         return {id, fbo, texture, stamp: -1, inUse: false, lastUsedFrame: -1};
     }
 

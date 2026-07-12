@@ -3787,6 +3787,13 @@ export class Map extends Camera {
 
         if (this._glStatsEnabled) this._reportGlStatsFrame();
 
+        // map2 fork: keep the terrain shader warm-up fed — restart the drain whenever
+        // new candidates were recorded (waiting for an `idle` event starves it: a
+        // streaming start may never go idle before the user first tilts)
+        if (this.painter._terrainWarmRecording && this.painter._terrainWarmPending.length > 0 && this._terrainWarmTimer == null) {
+            this.precompileTerrainPrograms();
+        }
+
         this.fire(new Event('render'));
 
         if (this.loaded() && !this._loaded) {
@@ -3870,6 +3877,10 @@ export class Map extends Camera {
         if (this._fencePollTimer != null) {
             clearTimeout(this._fencePollTimer);
             this._fencePollTimer = null;
+        }
+        if (this._terrainWarmTimer != null) {
+            clearTimeout(this._terrainWarmTimer);
+            this._terrainWarmTimer = null;
         }
         this._pendingGpuFences = [];
         this._renderTaskQueue.clear();
@@ -4163,6 +4174,85 @@ export class Map extends Camera {
         return this;
     }
 
+    /** map2 fork: pending timer for the terrain shader warm-up drain (precompileTerrainPrograms) */
+    _terrainWarmTimer: ReturnType<typeof setTimeout> | null = null;
+    _terrainWarmCount: number = 0;
+
+    /**
+     * map2 fork: record each 2D shader compile so its terrain variant can be
+     * pre-compiled during idle 2D (see {@link Map#precompileTerrainPrograms}).
+     * Enable right after map creation so the initial style's compiles are captured.
+     * Off by default: candidates retain their ProgramConfiguration until drained.
+     */
+    setTerrainProgramWarming(on: boolean): this {
+        if (this.painter) this.painter._terrainWarmRecording = !!on;
+        return this;
+    }
+
+    /**
+     * map2 fork: pre-compile the terrain variants of every recorded shader program,
+     * one per ~60ms tick and only while the render loop is quiet — so the first
+     * terrain frame finds a warm program cache instead of compiling the whole batch
+     * synchronously (measured ~300ms across ~19 variants on Adreno; the tablet's
+     * load stall). Safe to call repeatedly (e.g. on every `idle` event): it no-ops
+     * when a drain is already running and picks up any newly recorded candidates.
+     */
+    precompileTerrainPrograms(): this {
+        if (this._terrainWarmTimer != null) return this;
+        const tick = () => {
+            this._terrainWarmTimer = null;
+            if (!this.painter || this.painter.context.gl.isContextLost()) return;
+            // Stay out of the way of a MOVING camera (gesture/ease/flight) — a compile
+            // there is visible jank. A static map that happens to be repainting is fair
+            // game: a dropped frame over unchanged content is invisible, and waiting
+            // for a fully quiet loop never happens in apps that repaint continuously
+            // (field-observed: the drain starved until after the first 3D entry, which
+            // then paid the full 14-variant compile stall the warm-up exists to avoid).
+            if (this.isMoving() && performance.now() - this._lastRenderTimestamp < 100) {
+                this._terrainWarmTimer = setTimeout(tick, 150);
+                return;
+            }
+            // shader variants first, then RTT pool objects — both are first-terrain-
+            // frame stalls the idle time can absorb (compiles ~10–35ms, pool
+            // allocations 8–99ms each on Adreno)
+            if (this.painter.warmTerrainProgram() || this.painter.warmPoolObject()) {
+                this._terrainWarmCount++;
+                this._terrainWarmTimer = setTimeout(tick, 60);
+            } else if (this._terrainWarmCount > 0) {
+                console.log(`[map2-fork] warmed ${this._terrainWarmCount} terrain resource(s) (shaders + pool) during idle`);
+                this._terrainWarmCount = 0;
+            }
+        };
+        this._terrainWarmTimer = setTimeout(tick, 0);
+        return this;
+    }
+
+    /**
+     * map2 fork: pre-allocate RTT pool framebuffer+texture pairs during idle 2D, on
+     * the same drain as the shader warm-up. Pool allocation measured 8–99ms per
+     * object on Adreno — eight of them were 209ms of the first-terrain frame — so the
+     * working set for the first tilt is allocated ahead of time; terrain uninstall
+     * returns the live pool's objects to the stash, making 3D re-entries free too.
+     * Sizes are derived from the DEM source's tileSize (terrain ladder ×2, full RTT
+     * tier ×qualityFactor 2) until a real terrain install records the exact values.
+     */
+    prewarmTerrainPool(fullCount: number = 14, halfCount: number = 6, demSourceId?: string): this {
+        if (!this.painter) return this;
+        if (!this.painter._poolWarmTargets) {
+            const source = demSourceId ? this.style?.getSource(demSourceId) : null;
+            const sourceTileSize = (source as {tileSize?: number})?.tileSize ?? 512;
+            this.painter._poolWarmTargets = [
+                {size: sourceTileSize * 4, count: fullCount},
+                {size: sourceTileSize * 2, count: halfCount}
+            ];
+        } else {
+            this.painter._poolWarmTargets[0].count = fullCount;
+            if (this.painter._poolWarmTargets[1]) this.painter._poolWarmTargets[1].count = halfCount;
+        }
+        this.precompileTerrainPrograms();
+        return this;
+    }
+
     /**
      * map2 fork: does the current decode mode show layers this source's mode-mismatched
      * tiles are missing? Used by TileManager to catch parses that were already in
@@ -4383,7 +4473,16 @@ export class Map extends Camera {
             const failedProbe = now - this._lastPromotionTime < 3000;
             this._stepUpBlockedUntil = now + STEP_UP_COOLDOWN * (failedProbe ? 6 : 1);
         } else if (tier > 0 &&
-                   cpuMedian < vsync * divisors[tier - 1] * 0.7 &&
+                   // map2 fork recalibration: 0.85, was 0.7. Per-frame cpu cost is partly
+                   // proportional to the camera delta a frame covers, so a demoted tier
+                   // measures ~1.8× the cost the faster tier would see — with 0.7 a
+                   // workload that runs 6ms/frame at 60fps reads ~11ms at 30fps and sits
+                   // just over the 11.7ms gate forever (field-observed: stuck at 30 for
+                   // ~25s while the same run later held 60 comfortably). Promotion is a
+                   // PROBE: the queue-depth demotion catches a wrong one within a window
+                   // and the failed-probe cooldown stops flapping, so the gate can afford
+                   // optimism.
+                   cpuMedian < vsync * divisors[tier - 1] * 0.85 &&
                    depthMedian <= 1 &&
                    gpuMedian < vsync * divisors[tier - 1] * 1.2) {
             // step up only after a sustained streak and outside the post-demotion

@@ -81,3 +81,46 @@ describe('tile texture pool', () => {
         painter.destroy();
     });
 });
+
+// PATCH (map2-fork): idle-time terrain shader warm-up — record 2D compiles, then
+// pre-compile their /terrain twins (plus the pure terrain programs) one at a time
+// so the first terrain frame finds a warm cache (see Map#precompileTerrainPrograms).
+describe('terrain shader warm-up', () => {
+    test('records 2D compiles and warms their terrain twins one per call', () => {
+        const gl = document.createElement('canvas').getContext('webgl');
+        const transform = new MercatorTransform({minZoom: 0, maxZoom: 22, minPitch: 0, maxPitch: 60, renderWorldCopies: true});
+        transform.resize(512, 512);
+        const painter = new Painter(gl, transform);
+        const map = new StubMap() as any;
+        const style = new Style(map);
+        style._setProjectionInternal('mercator');
+        painter.style = style;
+        painter.context.gl.isContextLost = () => false;   // the mock GL reports lost
+
+        // no recording by default: a 2D compile leaves no candidate
+        painter.useProgram('fill');
+        expect(painter._terrainWarmPending).toHaveLength(0);
+
+        painter._terrainWarmRecording = true;
+        painter.useProgram('fillOutline');
+        expect(painter._terrainWarmPending).toHaveLength(1);
+        // a cache hit records nothing
+        painter.useProgram('fillOutline');
+        expect(painter._terrainWarmPending).toHaveLength(1);
+
+        // warm: pure terrain programs first, then the recorded twin, then dry
+        const keysWithTerrain = () => Object.keys(painter.cache).filter(k => k.includes('/terrain'));
+        expect(painter.warmTerrainProgram()).toBe(true);   // terrain
+        expect(painter.warmTerrainProgram()).toBe(true);   // terrainDepth
+        expect(painter.warmTerrainProgram()).toBe(true);   // terrainCoords
+        expect(painter.warmTerrainProgram()).toBe(true);   // fillOutline twin
+        expect(painter._terrainWarmPending).toHaveLength(0);
+        expect(keysWithTerrain().some(k => k.startsWith('fillOutline'))).toBe(true);
+        expect(painter.warmTerrainProgram()).toBe(false);  // everything warm
+
+        // the warmed twin is a cache HIT for the terrain render path
+        map.terrain = {};
+        const {compiled} = painter._getOrCompileProgram('fillOutline', null, true, false, []);
+        expect(compiled).toBe(false);
+    });
+});

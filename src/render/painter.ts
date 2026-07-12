@@ -34,6 +34,7 @@ import type {ImageManager} from './image_manager';
 import type {GlyphManager} from './glyph_manager';
 import type {VertexBuffer} from '../webgl/vertex_buffer';
 import type {IndexBuffer} from '../webgl/index_buffer';
+import type {Framebuffer} from '../webgl/framebuffer';
 import type {DepthRangeType, DepthMaskType, DepthFuncType} from '../webgl/types';
 import type {ResolvedImage} from '@maplibre/maplibre-gl-style-spec';
 import type {IRenderToTexture} from './render_to_texture_interface';
@@ -146,6 +147,20 @@ export class Painter {
      * rule at that boundary.
      */
     renderMode: '2d' | '3d';
+    /** map2 fork: record 2D compiles as terrain warm-up candidates (Map#setTerrainProgramWarming) */
+    _terrainWarmRecording: boolean;
+    /** map2 fork: 2D compiles whose /terrain twin hasn't been warmed yet */
+    _terrainWarmPending: Array<{name: string; configuration: ProgramConfiguration | null; defines: string[]}>;
+    /**
+     * map2 fork: pre-allocated / preserved RTT pool framebuffer+texture pairs. Pool
+     * object allocation measured 8–99ms EACH on Adreno (the ~280ms first-terrain
+     * stall), so the idle warm-up allocates ahead of the first tilt and terrain
+     * uninstall returns objects here instead of destroying them — re-entries and the
+     * first entry alike find their working set ready.
+     */
+    _poolStash: Array<{size: number; fbo: Framebuffer; texture: Texture}>;
+    /** map2 fork: how many pool objects of each pixel size the idle warm-up should hold ready */
+    _poolWarmTargets: Array<{size: number; count: number}> | null;
 
     /** map2 fork: is this layer excluded from the current render mode? */
     layerModeHidden(layer: StyleLayer): boolean {
@@ -161,6 +176,10 @@ export class Painter {
         this.terrainFacilitator = {depthDirty: true, coordsDirty: false, matrix: mat4.identity(new Float64Array(16) as any), renderTime: 0, coordsVersion: 0};
         this.uploadScheduler = new UploadScheduler();
         this.renderMode = '2d';
+        this._terrainWarmRecording = false;
+        this._terrainWarmPending = [];
+        this._poolStash = [];
+        this._poolWarmTargets = null;
 
         this.setup();
 
@@ -784,8 +803,27 @@ export class Painter {
      * @returns
      */
     useProgram(name: string, programConfiguration?: ProgramConfiguration | null, forceSimpleProjection: boolean = false, defines: string[] = []): Program<any> {
-        this.cache ||= {};
         const useTerrain = !!this.style.map.terrain;
+        const {program, compiled} = this._getOrCompileProgram(name, programConfiguration, useTerrain, forceSimpleProjection, defines);
+        // map2 fork: remember what a first-use 2D compile looked like so its /terrain
+        // twin can be pre-compiled during idle 2D (warmTerrainProgram) — first-terrain
+        // frames otherwise compile the whole variant batch synchronously (~300ms of the
+        // measured tablet load stall). Recording is opt-in (Map#setTerrainProgramWarming)
+        // because candidates retain their ProgramConfiguration until drained.
+        if (compiled && this._terrainWarmRecording && !useTerrain && !forceSimpleProjection &&
+            !this._showOverdrawInspector && this._terrainWarmPending.length < 64) {
+            this._terrainWarmPending.push({name, configuration: programConfiguration ?? null, defines});
+        }
+        return program;
+    }
+
+    /**
+     * map2 fork: compile-if-missing, shared by the render path (useProgram) and the
+     * idle-time terrain warm-up. Compiles are timed — the constructor's
+     * COMPILE/LINK_STATUS queries force synchronous driver compilation.
+     */
+    _getOrCompileProgram(name: string, programConfiguration: ProgramConfiguration | null | undefined, useTerrain: boolean, forceSimpleProjection: boolean, defines: string[]): {program: Program<any>; compiled: boolean} {
+        this.cache ||= {};
 
         const projection = this.style.projection;
 
@@ -800,11 +838,8 @@ export class Painter {
 
         const key = name + configurationKey + projectionKey + overdrawKey + terrainKey + definesKey;
 
+        let compiled = false;
         if (!this.cache[key]) {
-            // map2 fork: time cache-miss compiles — the constructor's COMPILE/LINK_STATUS
-            // queries force synchronous driver compilation, and first-3D frames compile a
-            // batch of terrain/RTT variants at once (suspect for the ~320ms tablet load
-            // stall). Counted into glstats; slow ones logged individually.
             const compileStart = performance.now();
             this.cache[key] = new Program(
                 this.context,
@@ -817,6 +852,7 @@ export class Painter {
                 projectionDefine,
                 defines
             );
+            compiled = true;
             const compileMs = performance.now() - compileStart;
             if (glStats.enabled) {
                 glStats.frame.programCompiles++;
@@ -826,7 +862,74 @@ export class Painter {
                 }
             }
         }
-        return this.cache[key];
+        return {program: this.cache[key], compiled};
+    }
+
+    /**
+     * map2 fork: compile ONE not-yet-compiled terrain shader variant — the pure terrain
+     * programs first, then the /terrain twin of each recorded 2D compile. Called from
+     * Map#precompileTerrainPrograms on an idle-paced timer so the ~10–35ms per compile
+     * (measured on Adreno) lands in quiet 2D time instead of the first terrain frame.
+     * @returns true if a program was compiled; false when everything is already warm
+     */
+    warmTerrainProgram(): boolean {
+        if (!this.style || this.context.gl.isContextLost()) return false;
+        for (const name of ['terrain', 'terrainDepth', 'terrainCoords']) {
+            if (this._getOrCompileProgram(name, null, true, false, []).compiled) return true;
+        }
+        while (this._terrainWarmPending.length > 0) {
+            const candidate = this._terrainWarmPending.shift();
+            if (this._getOrCompileProgram(candidate.name, candidate.configuration, true, false, candidate.defines).compiled) return true;
+        }
+        return false;
+    }
+
+    /** map2 fork: hand a stashed framebuffer+texture pair to a RenderPool (see _poolStash) */
+    takePoolStash(size: number): {fbo: Framebuffer; texture: Texture} | null {
+        for (let i = 0; i < this._poolStash.length; i++) {
+            if (this._poolStash[i].size === size) {
+                const [entry] = this._poolStash.splice(i, 1);
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /** map2 fork: keep a destructed pool object's GPU resources for the next install */
+    stashPoolObject(size: number, fbo: Framebuffer, texture: Texture): boolean {
+        if (this._poolStash.length >= 96) return false;
+        this._poolStash.push({size, fbo, texture});
+        return true;
+    }
+
+    /**
+     * map2 fork: allocate ONE RTT pool object toward the warm targets, on the same
+     * idle drain as the shader warm-up. No-ops while terrain is installed (the live
+     * pools own the objects; uninstall returns them to the stash).
+     * @returns true if an object was allocated; false when targets are satisfied
+     */
+    warmPoolObject(): boolean {
+        if (!this._poolWarmTargets || this.renderToTexture || this.context.gl.isContextLost()) return false;
+        for (const target of this._poolWarmTargets) {
+            const have = this._poolStash.reduce((n, entry) => n + (entry.size === target.size ? 1 : 0), 0);
+            if (have >= target.count) continue;
+            const allocStart = performance.now();
+            const gl = this.context.gl;
+            const fbo = this.context.createFramebuffer(target.size, target.size, true, true);
+            const texture = new Texture(this.context, {width: target.size, height: target.size, data: null}, gl.RGBA);
+            texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE);
+            if (this.context.extTextureFilterAnisotropic) {
+                gl.texParameterf(gl.TEXTURE_2D, this.context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this.context.extTextureFilterAnisotropicMax);
+            }
+            fbo.colorAttachment.set(texture.texture);
+            this._poolStash.push({size: target.size, fbo, texture});
+            const allocMs = performance.now() - allocStart;
+            if (glStats.enabled && allocMs > 8) {
+                console.log(`[map2-fork] slow pool alloc (warm): ${target.size}px ${allocMs.toFixed(1)}ms`);
+            }
+            return true;
+        }
+        return false;
     }
 
     /*
@@ -869,6 +972,11 @@ export class Painter {
     }
 
     destroy() {
+        for (const entry of this._poolStash) {
+            entry.texture.destroy();
+            entry.fbo.destroy();
+        }
+        this._poolStash = [];
         if (this._tileTextures) {
             for (const size in this._tileTextures) {
                 const textures = this._tileTextures[size];

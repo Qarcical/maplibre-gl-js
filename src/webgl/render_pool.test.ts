@@ -1,6 +1,7 @@
 import {describe, test, expect, vi} from 'vitest';
 import {Context} from './context';
 import {RenderPool} from './render_pool';
+import {Texture} from './texture';
 
 describe('render pool', () => {
     const POOL_SIZE = 3;
@@ -94,5 +95,57 @@ describe('render pool', () => {
         const pool = createAndFillPool();
         pool.destruct();
         expect(pool.getObjectForId(0).texture.texture).toBeNull();
+    });
+});
+
+// PATCH (map2-fork): the pool adopts pre-allocated framebuffer+texture pairs from a
+// stash (idle-time prewarm) and returns them on destruct (terrain uninstall) — pool
+// allocation is 8–99ms per object on Adreno, the measured first-terrain-frame stall.
+describe('render pool object stash', () => {
+    test('destruct returns objects to the stash and a new pool adopts them', () => {
+        const gl = document.createElement('canvas').getContext('webgl');
+        vi.spyOn(gl, 'checkFramebufferStatus').mockReturnValue(gl.FRAMEBUFFER_COMPLETE);
+        const context = new Context(gl);
+        const stashed = [];
+        const stash = {
+            takePoolStash(size: number) {
+                for (let i = 0; i < stashed.length; i++) {
+                    if (stashed[i].size === size) {
+                        const [entry] = stashed.splice(i, 1);
+                        return entry;
+                    }
+                }
+                return null;
+            },
+            stashPoolObject(size: number, fbo: any, texture: any) {
+                stashed.push({size, fbo, texture});
+                return true;
+            }
+        };
+
+        // first install: allocates for real, uninstall stashes instead of destroying
+        const poolA = new RenderPool(context, 4, 512, stash as any);
+        const objA = poolA.getOrCreateFreeObject();
+        const textureA = objA.texture;
+        const destroySpy = vi.spyOn(textureA, 'destroy');
+        poolA.destruct();
+        expect(stashed).toHaveLength(1);
+        expect(destroySpy).not.toHaveBeenCalled();
+
+        // second install: adopts the stashed pair instead of allocating
+        const poolB = new RenderPool(context, 4, 512, stash as any);
+        const adopted = poolB.getOrCreateFreeObject();
+        expect(adopted.texture).toBe(textureA);
+        expect(stashed).toHaveLength(0);
+        poolB.useObject(adopted);
+
+        // stash empty: further growth allocates for real
+        const second = poolB.getOrCreateFreeObject();
+        expect(second.texture).not.toBe(textureA);
+        poolB.useObject(second);
+
+        poolB.destruct();
+        expect(stashed).toHaveLength(2);
+        expect(stashed.every(entry => entry.size === 512)).toBe(true);
     });
 });

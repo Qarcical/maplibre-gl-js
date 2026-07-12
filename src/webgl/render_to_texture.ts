@@ -124,9 +124,21 @@ export class RenderToTexture {
     constructor(painter: Painter, terrain: Terrain) {
         this.painter = painter;
         this.terrain = terrain;
+        // map2 fork: pools adopt pre-allocated objects from the painter's stash and
+        // return them on destruct — pool allocation is 8–99ms EACH on Adreno, so the
+        // idle warm-up (Map#prewarmTerrainPool) front-loads it. Record the real sizes
+        // so the warm targets track the actual DEM configuration.
+        const fullTileSize = terrain.tileManager.tileSize * terrain.qualityFactor;
+        const halfTileSize = terrain.tileManager.tileSize;
+        if (!painter._poolWarmTargets || painter._poolWarmTargets[0]?.size !== fullTileSize) {
+            painter._poolWarmTargets = [
+                {size: fullTileSize, count: painter._poolWarmTargets?.[0]?.count ?? 14},
+                {size: halfTileSize, count: painter._poolWarmTargets?.[1]?.count ?? 6}
+            ];
+        }
         this.pools = [
-            new RenderPool(painter.context, 30, terrain.tileManager.tileSize * terrain.qualityFactor),
-            new RenderPool(painter.context, 30, terrain.tileManager.tileSize)
+            new RenderPool(painter.context, 30, fullTileSize, painter),
+            new RenderPool(painter.context, 30, halfTileSize, painter)
         ];
         this._pendingSourceTileChanges = [];
         this._softRerenderBudget = 0;

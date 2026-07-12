@@ -59,6 +59,12 @@ export type GlStatsFrame = {
     bufferUploads: number;
     /** bytes uploaded by those buffer calls */
     bufferUploadBytes: number;
+    /** RTT pool objects created this frame (framebuffer + 4–16MB texture each) */
+    poolAllocs: number;
+    /** ms spent creating them — the first terrain frame allocates the whole working set */
+    poolAllocMs: number;
+    /** ms spent uploading DEM textures this frame (R32F, main-thread texImage2D) */
+    demUploadMs: number;
     /** shader programs compiled+linked this frame (Painter.useProgram cache misses) */
     programCompiles: number;
     /**
@@ -99,6 +105,9 @@ function zeroFrame(): GlStatsFrame {
         texUploadBytes: 0,
         bufferUploads: 0,
         bufferUploadBytes: 0,
+        poolAllocs: 0,
+        poolAllocMs: 0,
+        demUploadMs: 0,
         programCompiles: 0,
         programCompileMs: 0,
         tileUploadsGranted: 0,

@@ -6,6 +6,7 @@ import {Pos3dArray, TriangleIndexArray} from '../data/array_types.g';
 import pos3dAttributes from '../data/pos3d_attributes';
 import {SegmentVector} from '../data/segment';
 import {Texture} from '../webgl/texture';
+import {glStats} from '../webgl/gl_stats';
 import {MercatorCoordinate} from '../geo/mercator_coordinate';
 import {TerrainTileManager} from '../tile/terrain_tile_manager';
 import {EXTENT} from '../data/extent';
@@ -296,7 +297,14 @@ export class Terrain {
             sourceTile.needsTerrainPrepare = false;
             // a 16MB DEM upload spends the same main-thread time the upload scheduler
             // budgets — debit it so a DEM-heavy frame grants fewer vector tiles
-            this.painter.uploadScheduler?.noteExternalUpload(performance.now() - uploadStart);
+            const demUploadMs = performance.now() - uploadStart;
+            this.painter.uploadScheduler?.noteExternalUpload(demUploadMs);
+            if (glStats.enabled) {
+                glStats.frame.demUploadMs += demUploadMs;
+                if (demUploadMs > 8) {
+                    console.log(`[map2-fork] slow DEM upload: ${sourceTile.tileID.key} ${demUploadMs.toFixed(1)}ms`);
+                }
+            }
         }
         // create matrix for lookup in dem data
         const matrixKey = sourceTile && sourceTile.toString() + sourceTile.tileID.key + tileID.key;
