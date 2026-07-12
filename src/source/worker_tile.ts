@@ -36,6 +36,8 @@ export class WorkerTile {
     showCollisionBoxes: boolean;
     collectResourceTiming: boolean;
     returnDependencies: boolean;
+    /** PATCH (map2-fork): mode this parse is for — see WorkerTileParameters.renderMode */
+    renderMode: '2d' | '3d' | undefined;
 
     status: 'parsing' | 'done';
     data: VectorTileLike;
@@ -57,6 +59,7 @@ export class WorkerTile {
         this.collectResourceTiming = !!params.collectResourceTiming;
         this.returnDependencies = !!params.returnDependencies;
         this.promoteId = params.promoteId;
+        this.renderMode = params.renderMode;
         this.inFlightDependencies = [];
     }
 
@@ -109,6 +112,11 @@ export class WorkerTile {
                     warnOnce(`layer.source = ${layer.source} does not equal this.source = ${this.source}`);
                 }
                 if (layer.isHidden(this.zoom, true)) continue;
+                // PATCH (map2-fork): mode-hidden layers get no bucket at all — skipping
+                // here saves the bucket build, the data-driven paint-array bake AND the
+                // GL upload the bucket would cost on arrival. The main thread knows the
+                // tile was parsed under this.renderMode and re-parses on a mode flip.
+                if (this.renderMode && layer.visibleWhen && layer.visibleWhen !== this.renderMode) continue;
                 recalculateLayers(family, this.zoom, availableImages);
 
                 const bucket = buckets[layer.id] = layer.createBucket({

@@ -42,6 +42,15 @@ export type WorkerTileParameters = TileParameters & {
     subdivisionGranularity: SubdivisionGranularitySetting;
     encoding?: string;
     /**
+     * PATCH (map2-fork): the render mode this parse is for. Layers whose
+     * `map2:visible-when` metadata excludes it get NO bucket build and NO paint-array
+     * bake — the decode-time cost of mode-hidden layers (measured as most of the 3D
+     * streaming upload bytes for contours). Tiles record the mode they were parsed
+     * under; Map#setDecodeMode re-parses the ones that lack the new mode's layers.
+     * Absent = parse everything (stock behaviour).
+     */
+    renderMode?: '2d' | '3d';
+    /**
      * Provide this property when the requested tile has a higher canonical Z than source maxzoom.
      * This allows the worker to know that it needs to overzoom from a source tile.
      */

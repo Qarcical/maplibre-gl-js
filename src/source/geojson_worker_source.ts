@@ -130,6 +130,8 @@ export class GeoJSONWorkerSource implements WorkerSource {
         if (!workerTile) throw new Error('Should not be trying to reload a tile that was never loaded or has been removed');
 
         workerTile.showCollisionBoxes = params.showCollisionBoxes;
+        // PATCH (map2-fork): adopt the reload's render mode (see vector_tile_worker_source)
+        workerTile.renderMode = params.renderMode;
 
         if (workerTile.status === 'parsing') {
             // If we are cancelling the original parse, make sure to pass the rawData from the original parse.

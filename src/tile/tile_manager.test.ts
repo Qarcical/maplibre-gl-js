@@ -18,6 +18,7 @@ import {type TileCache} from './tile_cache';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
 import {GlobeTransform} from '../geo/projection/globe_transform';
 import {coveringTiles} from '../geo/projection/covering_tiles';
+import {UploadScheduler} from '../render/upload_scheduler';
 
 class SourceMock extends Evented implements Source {
     id: string;
@@ -2584,5 +2585,212 @@ describe('TileManager / etag', () => {
         expect(loadCount).toBe(2);
         expect(dataEventSpy).not.toHaveBeenCalled();
         expect(tile.etag).toBe(tileEtag);
+    });
+});
+
+// PATCH (map2-fork): upload spreading — freshly-arrived tiles gate their first GPU
+// upload behind the painter's UploadScheduler (see upload_scheduler.ts)
+describe('TileManager upload spreading', () => {
+    function fakeBucket() {
+        const bucket = {
+            pending: true,
+            uploadPending: () => bucket.pending,
+            upload: () => { bucket.pending = false; },
+            destroy: () => {}
+        };
+        return bucket;
+    }
+
+    function createGatedSetup() {
+        const scheduler = new UploadScheduler();
+        const tileManager = createTileManager();
+        tileManager.map = {
+            painter: {uploadScheduler: scheduler, renderToTexture: null},
+            style: {imageManager: {}}
+        } as any;
+
+        const makeTile = (tileID: OverscaledTileID, gated: boolean) => {
+            const tile = new Tile(tileID, 512);
+            tile.state = 'loaded';
+            (tile as any).buckets = {layer: fakeBucket()};
+            tile.gatedUpload = gated;
+            tileManager._inViewTiles.setTile(tileID.key, tile);
+            return tile;
+        };
+        return {scheduler, tileManager, makeTile, context: {gl: {}} as any};
+    }
+
+    test('_tileLoaded gates fresh loads but never reloads', () => {
+        const {tileManager} = createGatedSetup();
+        const fresh = new Tile(new OverscaledTileID(1, 0, 1, 0, 0), 512);
+        fresh.state = 'loaded';
+        (fresh as any).buckets = {layer: fakeBucket()};
+        tileManager._tileLoaded(fresh, fresh.tileID.key, 'loading', undefined);
+        expect(fresh.gatedUpload).toBe(true);
+
+        const reloaded = new Tile(new OverscaledTileID(1, 0, 1, 1, 0), 512);
+        reloaded.state = 'loaded';
+        (reloaded as any).buckets = {layer: fakeBucket()};
+        tileManager._tileLoaded(reloaded, reloaded.tileID.key, 'reloading', undefined);
+        expect(reloaded.gatedUpload).toBe(false);
+    });
+
+    test('a gated tile is not renderable and does not count as a loaded substitute', () => {
+        const {tileManager, makeTile} = createGatedSetup();
+        const tile = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+        expect(tile.isRenderable(false)).toBe(false);
+        expect(tileManager._inViewTiles.getLoadedTile(tile.tileID)).toBeNull();
+        tile.gatedUpload = false;
+        expect(tile.isRenderable(false)).toBe(true);
+        expect(tileManager._inViewTiles.getLoadedTile(tile.tileID)).toBe(tile);
+    });
+
+    test('prepare defers a covered tile when the budget is spent, grants it when refreshed', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const parent = makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);
+        const child = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);           // budget spent
+        tileManager.prepare(context);
+        expect((parent as any).buckets.layer.pending).toBe(false);   // ungated path uploads
+        expect((child as any).buckets.layer.pending).toBe(true);     // deferred: parent covers it
+        expect(child.gatedUpload).toBe(true);
+        expect(scheduler.deferred).toBe(1);
+
+        scheduler.onFrameStart(16.7);          // fresh budget next frame
+        tileManager.prepare(context);
+        expect((child as any).buckets.layer.pending).toBe(false);
+        expect(child.gatedUpload).toBe(false);
+        expect(scheduler.granted).toBe(1);
+    });
+
+    test('a tile with no renderable substitute is granted even with the budget spent', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const tile = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect((tile as any).buckets.layer.pending).toBe(false);     // blank is worse than burst
+        expect(tile.gatedUpload).toBe(false);
+    });
+
+    test('volatile sources bypass the budget', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.volatileSources.add('id');   // the mock manager's source id
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);
+        const child = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect((child as any).buckets.layer.pending).toBe(false);
+        expect(child.gatedUpload).toBe(false);
+    });
+
+    test('grant fires a held RTT invalidation, deferral does not', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const markSourceTileChanged = vi.fn();
+        (tileManager.map as any).painter.renderToTexture = {markSourceTileChanged};
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);
+        const child = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+        child.heldRttInvalidation = true;
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect(markSourceTileChanged).not.toHaveBeenCalled();        // deferred → held
+
+        scheduler.onFrameStart(16.7);
+        tileManager.prepare(context);
+        expect(markSourceTileChanged).toHaveBeenCalledWith('id', child.tileID);
+        expect(child.heldRttInvalidation).toBe(false);
+    });
+
+    test('spreading disabled: gated flags clear and everything uploads', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.enabled = false;
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);
+        const child = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect((child as any).buckets.layer.pending).toBe(false);
+        expect(child.gatedUpload).toBe(false);
+    });
+});
+
+// PATCH (map2-fork): visible-when mode repair — tiles parsed under a mode that
+// excluded some layers re-parse when the decode mode flips back (see Map#setDecodeMode)
+describe('TileManager.reloadTilesForMode', () => {
+    test('re-parses only loaded tiles parsed under a different mode', () => {
+        const tileManager = createTileManager();
+        const reloaded: string[] = [];
+        (tileManager as any)._reloadTile = (id: string) => { reloaded.push(id); };
+
+        const addTile = (tileID: OverscaledTileID, parsedMode: '2d' | '3d' | undefined, state: string) => {
+            const tile = new Tile(tileID, 512);
+            tile.state = state as any;
+            tile.parsedMode = parsedMode;
+            tileManager._inViewTiles.setTile(tileID.key, tile);
+            return tile;
+        };
+        const stale = addTile(new OverscaledTileID(1, 0, 1, 0, 0), '3d', 'loaded');
+        addTile(new OverscaledTileID(1, 0, 1, 1, 0), '2d', 'loaded');       // already right
+        addTile(new OverscaledTileID(1, 0, 1, 0, 1), undefined, 'loaded');  // stock parse: has everything
+        addTile(new OverscaledTileID(1, 0, 1, 1, 1), '3d', 'reloading');    // already re-parsing
+
+        expect(tileManager.reloadTilesForMode('2d')).toBe(1);
+        expect(reloaded).toEqual([stale.tileID.key]);
+    });
+});
+
+// PATCH (map2-fork): the flip-time repair pass only sees in-view tiles — a tile that
+// went into the out-of-view cache during 3D (parsed without the '2d'-tagged buckets)
+// must be repaired when it is promoted back into view under the other decode mode.
+describe('TileManager mode repair on cache promotion', () => {
+    function setup(decodeMode: '2d' | '3d', repairNeeded: boolean) {
+        const tileManager = createTileManager();
+        tileManager.map = {
+            painter: {},
+            _decodeMode: decodeMode,
+            _modeRepairNeeded: () => repairNeeded
+        } as any;
+        const reloaded: string[] = [];
+        (tileManager as any)._reloadTile = (id: string) => { reloaded.push(id); };
+        (tileManager as any)._outOfViewCache.setMaxSize(10);   // harness default is 0 = evict on add
+        const cacheTile = (tileID: OverscaledTileID, parsedMode: '2d' | '3d' | undefined) => {
+            const tile = new Tile(tileID, 512);
+            tile.state = 'loaded';
+            tile.parsedMode = parsedMode;
+            (tileManager as any)._outOfViewCache.add(tileID, tile, undefined);
+            return tile;
+        };
+        return {tileManager, reloaded, cacheTile};
+    }
+
+    test('promoting a mode-mismatched cached tile triggers a repair reload', () => {
+        const {tileManager, reloaded, cacheTile} = setup('2d', true);
+        const staleID = new OverscaledTileID(1, 0, 1, 0, 0);
+        cacheTile(staleID, '3d');                                  // cached during 3D
+        const freshID = new OverscaledTileID(1, 0, 1, 1, 0);
+        cacheTile(freshID, '2d');                                  // already complete
+        const stockID = new OverscaledTileID(1, 0, 1, 0, 1);
+        cacheTile(stockID, undefined);                             // stock parse: has everything
+
+        tileManager._addTile(staleID);
+        tileManager._addTile(freshID);
+        tileManager._addTile(stockID);
+        expect(reloaded).toEqual([staleID.key]);
+    });
+
+    test('no repair when the current mode has no mode-tagged layers on this source', () => {
+        const {tileManager, reloaded, cacheTile} = setup('3d', false);
+        const tileID = new OverscaledTileID(1, 0, 1, 0, 0);
+        cacheTile(tileID, '2d');
+        tileManager._addTile(tileID);
+        expect(reloaded).toEqual([]);
     });
 });

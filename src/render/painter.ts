@@ -22,6 +22,8 @@ import {selectDebugSource, webglDrawFunctions, type DrawFunctions} from '../webg
 import {type OverscaledTileID} from '../tile/tile_id';
 import {Mesh} from './mesh';
 import {MercatorShaderDefine, MercatorShaderVariantKey} from '../geo/projection/mercator_projection';
+import {UploadScheduler} from './upload_scheduler';
+import {glStats} from '../webgl/gl_stats';
 
 import type {IReadonlyTransform} from '../geo/transform_interface';
 import type {Style} from '../style/style';
@@ -132,6 +134,23 @@ export class Painter {
     // of the terrain-facilitators. e.g. depth & coords framebuffers
     // every time the camera-matrix changes the terrain-facilitators will be redrawn.
     terrainFacilitator: {depthDirty: boolean; coordsDirty: boolean; matrix: mat4; renderTime: number; coordsVersion: number};
+    // map2 fork: per-frame time budget for tile GPU uploads (see upload_scheduler.ts);
+    // TileManager.prepare gates freshly-arrived tiles through it
+    uploadScheduler: UploadScheduler;
+    /**
+     * map2 fork: the mode `map2:visible-when`-tagged layers are checked against — layers
+     * tagged for the other mode are skipped by the render loops and the RTT stack
+     * machinery (no draws, no stack content, no pool demand, and live splitters stop
+     * splitting). Set via Map#setRenderMode at the app's 2D↔3D plateau crossing; the
+     * flip changes the RTT stack signature, so it full-wipes — acceptable, already the
+     * rule at that boundary.
+     */
+    renderMode: '2d' | '3d';
+
+    /** map2 fork: is this layer excluded from the current render mode? */
+    layerModeHidden(layer: StyleLayer): boolean {
+        return !!(layer.visibleWhen && layer.visibleWhen !== this.renderMode);
+    }
 
     constructor(gl: WebGLRenderingContext | WebGL2RenderingContext, transform: IReadonlyTransform) {
         this.drawFunctions = webglDrawFunctions;
@@ -140,6 +159,8 @@ export class Painter {
         this._tileTextures = {};
         this.extrusionClipRect = null;
         this.terrainFacilitator = {depthDirty: true, coordsDirty: false, matrix: mat4.identity(new Float64Array(16) as any), renderTime: 0, coordsVersion: 0};
+        this.uploadScheduler = new UploadScheduler();
+        this.renderMode = '2d';
 
         this.setup();
 
@@ -509,6 +530,10 @@ export class Painter {
         const coordsDescendingSymbol: {[_: string]: OverscaledTileID[]} = {};
         const renderOptions: RenderOptions = {isRenderingToTexture: false, isRenderingGlobe: style.projection?.transitionState > 0};
 
+        // map2 fork: refresh which sources bypass the upload budget (per-frame anim
+        // overlays) before the prepare loop asks for grants
+        this.uploadScheduler.updateVolatileSources(style);
+
         for (const id in tileManagers) {
             const tileManager = tileManagers[id];
             if (tileManager.used) {
@@ -518,6 +543,13 @@ export class Painter {
             coordsAscending[id] = tileManager.getVisibleCoordinates(false);
             coordsDescending[id] = coordsAscending[id].slice().reverse();
             coordsDescendingSymbol[id] = tileManager.getVisibleCoordinates(true).reverse();
+        }
+
+        if (glStats.enabled) {
+            glStats.frame.tileUploadsGranted = this.uploadScheduler.granted;
+            glStats.frame.tileUploadsDeferred = this.uploadScheduler.deferred;
+            glStats.frame.tileUploadMs = this.uploadScheduler.uploadMs;
+            glStats.frame.tileUploadBudgetMs = this.uploadScheduler.budgetMs;
         }
 
         this.opaquePassCutoff = Infinity;
@@ -545,7 +577,7 @@ export class Painter {
 
         for (const layerId of layerIds) {
             const layer = this.style._layers[layerId];
-            if (!layer.hasOffscreenPass() || layer.isHidden(this.transform.zoom)) continue;
+            if (!layer.hasOffscreenPass() || layer.isHidden(this.transform.zoom) || this.layerModeHidden(layer)) continue;
 
             const coords = coordsDescending[layer.source];
             if (layer.type !== 'custom' && !coords.length) continue;
@@ -681,7 +713,7 @@ export class Painter {
     }
 
     renderLayer(painter: Painter, tileManager: TileManager, layer: StyleLayer, coords: OverscaledTileID[], renderOptions: RenderOptions) {
-        if (layer.isHidden(this.transform.zoom)) return;
+        if (layer.isHidden(this.transform.zoom) || this.layerModeHidden(layer)) return;
         if (layer.type !== 'background' && layer.type !== 'custom' && !(coords || []).length) return;
         this.id = layer.id;
 
@@ -768,17 +800,32 @@ export class Painter {
 
         const key = name + configurationKey + projectionKey + overdrawKey + terrainKey + definesKey;
 
-        this.cache[key] ||= new Program(
-            this.context,
-            shaders[name],
-            programConfiguration,
-            programUniforms[name],
-            this._showOverdrawInspector,
-            useTerrain,
-            projectionPrelude,
-            projectionDefine,
-            defines
-        );
+        if (!this.cache[key]) {
+            // map2 fork: time cache-miss compiles — the constructor's COMPILE/LINK_STATUS
+            // queries force synchronous driver compilation, and first-3D frames compile a
+            // batch of terrain/RTT variants at once (suspect for the ~320ms tablet load
+            // stall). Counted into glstats; slow ones logged individually.
+            const compileStart = performance.now();
+            this.cache[key] = new Program(
+                this.context,
+                shaders[name],
+                programConfiguration,
+                programUniforms[name],
+                this._showOverdrawInspector,
+                useTerrain,
+                projectionPrelude,
+                projectionDefine,
+                defines
+            );
+            const compileMs = performance.now() - compileStart;
+            if (glStats.enabled) {
+                glStats.frame.programCompiles++;
+                glStats.frame.programCompileMs += compileMs;
+                if (compileMs > 8) {
+                    console.log(`[map2-fork] slow shader compile: ${key} ${compileMs.toFixed(1)}ms`);
+                }
+            }
+        }
         return this.cache[key];
     }
 

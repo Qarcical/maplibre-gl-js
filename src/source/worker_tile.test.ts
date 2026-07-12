@@ -12,7 +12,7 @@ import {type CirclePaintProps, type CirclePaintPropsPossiblyEvaluated} from '../
 import {type SymbolLayoutProps, type SymbolLayoutPropsPossiblyEvaluated} from '../style/style_layer/symbol_style_layer_properties.g';
 import {MessageType} from '../util/actor_messages';
 
-function createWorkerTile(params?: {globalState?: Record<string, any>}): WorkerTile {
+function createWorkerTile(params?: {globalState?: Record<string, any>; renderMode?: '2d' | '3d'}): WorkerTile {
     return new WorkerTile({
         uid: '',
         zoom: 0,
@@ -21,7 +21,8 @@ function createWorkerTile(params?: {globalState?: Record<string, any>}): WorkerT
         source: 'source',
         tileID: new OverscaledTileID(1, 0, 1, 1, 1),
         overscaling: 1,
-        globalState: params?.globalState
+        globalState: params?.globalState,
+        renderMode: params?.renderMode
     } as any as WorkerTileParameters);
 }
 
@@ -55,6 +56,32 @@ describe('worker tile', () => {
         const result = await tile.parse(createWrapper(), layerIndex, [], {} as any, SubdivisionGranularitySetting.noSubdivision) as WorkerTileWithData;
         expect(result.buckets[0]).toBeTruthy();
         console.warn = originalWarn;
+    });
+
+    // PATCH (map2-fork): layers tagged `map2:visible-when` for another mode get no
+    // bucket at parse time — the decode-side half of the mode gating (upload spreader
+    // handover item 3e). Untagged layers and matching-mode layers parse as normal;
+    // no renderMode (stock callers) parses everything.
+    test('WorkerTile.parse skips layers whose visible-when excludes the render mode', async () => {
+        const layerIndex = new StyleLayerIndex([{
+            id: 'contour',
+            source: 'source',
+            type: 'circle',
+            metadata: {'map2:visible-when': '2d'}
+        }, {
+            id: 'roads',
+            source: 'source',
+            type: 'circle'
+        }]);
+
+        const in3d = await createWorkerTile({renderMode: '3d'}).parse(createWrapper(), layerIndex, [], {} as any, SubdivisionGranularitySetting.noSubdivision) as WorkerTileWithData;
+        expect(in3d.buckets.map(b => b.layerIds[0])).toEqual(['roads']);
+
+        const in2d = await createWorkerTile({renderMode: '2d'}).parse(createWrapper(), layerIndex, [], {} as any, SubdivisionGranularitySetting.noSubdivision) as WorkerTileWithData;
+        expect(in2d.buckets.map(b => b.layerIds[0]).sort()).toEqual(['contour', 'roads']);
+
+        const stock = await createWorkerTile().parse(createWrapper(), layerIndex, [], {} as any, SubdivisionGranularitySetting.noSubdivision) as WorkerTileWithData;
+        expect(stock.buckets.map(b => b.layerIds[0]).sort()).toEqual(['contour', 'roads']);
     });
 
     test('WorkerTile.parse layer with layout property', async () => {

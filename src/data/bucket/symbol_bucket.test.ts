@@ -17,6 +17,7 @@ import {type StyleGlyph} from '../../style/style_glyph';
 import {SubdivisionGranularitySetting} from '../../render/subdivision_granularity_settings';
 import {MercatorTransform} from '../../geo/projection/mercator_transform';
 import {createPopulateOptions, loadVectorTile} from '../../../test/unit/lib/tile';
+import {Context} from '../../webgl/context';
 
 const collisionBoxArray = new CollisionBoxArray();
 const transform = new MercatorTransform();
@@ -107,6 +108,42 @@ describe('SymbolBucket', () => {
         place(bucketB.layers[0], tileB);
         const b2 = placement.collisionIndex.grid.keysLength();
         expect(b2).toBe(a2);
+    });
+
+    // PATCH (map2-fork): under upload spreading, a gated tile reaches its first upload
+    // BEFORE placement has ever run on it (it wasn't renderable during the placement
+    // pass). The opacity buffer is created at the array's size and updateData can never
+    // resize it, so upload must pre-fill the array — one hidden-opacity entry per quad —
+    // or the first placement commit crashes ("Length of new data is N, which doesn't
+    // match current length of 0").
+    test('upload before placement pre-sizes the opacity buffers (upload spreading)', () => {
+        const bucket = bucketSetup();
+        bucket.populate(features, createPopulateOptions([]), undefined as any);
+        const fakeGlyph = {rect: {w: 10, h: 10}, metrics: {left: 10, top: 10, advance: 10}};
+        performSymbolLayout({
+            bucket,
+            glyphMap: stacks,
+            // glyph positions so the layout emits actual glyph quads
+            glyphPositions: {'Test': {97: fakeGlyph, 98: fakeGlyph, 99: fakeGlyph, 100: fakeGlyph, 101: fakeGlyph} as any},
+            subdivisionGranularity: SubdivisionGranularitySetting.noSubdivision
+        } as any);
+
+        // the gated-upload ordering: layout data exists, placement hasn't sized opacities
+        expect(bucket.text.layoutVertexArray.length).toBeGreaterThan(0);
+        expect(bucket.text.opacityVertexArray.length).toBe(0);
+
+        const gl = document.createElement('canvas').getContext('webgl');
+        bucket.upload(new Context(gl));
+
+        // buffer born at final size: one packed opacity per quad, all hidden
+        expect(bucket.text.opacityVertexArray.length).toBe(bucket.text.layoutVertexArray.length / 4);
+        expect(bucket.text.hasVisibleVertices).toBe(false);
+
+        // the line that crashed: placement's first commit updateDatas the buffer
+        const placement = new Placement(transform, undefined as any, 0, true);
+        const tileID = new OverscaledTileID(0, 0, 0, 0, 0);
+        expect(() => placement.updateBucketOpacities(bucket, tileID, {}, collisionBoxArray)).not.toThrow();
+        expect(bucket.text.opacityVertexArray.length).toBe(bucket.text.layoutVertexArray.length / 4);
     });
 
     test('SymbolBucket integer overflow', () => {

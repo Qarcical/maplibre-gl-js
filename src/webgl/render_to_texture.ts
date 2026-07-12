@@ -180,7 +180,11 @@ export class RenderToTexture {
         this._prevType = null;
         this._rttTiles = [];
         this._renderableTiles = this.terrain.tileManager.getRenderableTiles();
-        this._renderableLayerIds = style._order.filter(id => !style._layers[id].isHidden(zoom));
+        // mode-hidden layers (map2:visible-when) are excluded here, so they contribute no
+        // stack content, no pool demand, and — for live layers — no stack SPLIT; their
+        // absence changes the stack signature, so a mode flip full-wipes (by design)
+        // (defensive call: unit tests mock the painter without the mode helper)
+        this._renderableLayerIds = style._order.filter(id => !style._layers[id].isHidden(zoom) && !this.painter.layerModeHidden?.(style._layers[id]));
 
         this._coordsAscending = {};
         for (const id in style.tileManagers) {
@@ -352,7 +356,7 @@ export class RenderToTexture {
      * @returns if true layer is rendered to texture, otherwise false
      */
     renderLayer(layer: StyleLayer, renderOptions: RenderOptions): boolean {
-        if (layer.isHidden(this.painter.transform.zoom)) return false;
+        if (layer.isHidden(this.painter.transform.zoom) || this.painter.layerModeHidden?.(layer)) return false;
 
         const options: RenderOptions = {...renderOptions, isRenderingToTexture: true};
         const type = layer.type;

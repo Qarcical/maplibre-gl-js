@@ -216,9 +216,13 @@ export class VectorTileSource extends Evented implements Source {
             promoteId: this.promoteId,
             subdivisionGranularity: this.map.style.projection.subdivisionGranularity,
             encoding: this.encoding,
+            renderMode: this.map._decodeMode,
             overzoomParameters: await this._getOverzoomParameters(tile),
             etag: tile.etag
         };
+        // PATCH (map2-fork): record which mode this parse covers so a later decode-mode
+        // flip knows exactly which tiles lack which buckets (no guessing at mode exit)
+        tile.parsedMode = this.map._decodeMode;
         params.request.collectResourceTiming = this._collectResourceTiming;
         let messageType: MessageType.loadTile | MessageType.reloadTile = MessageType.reloadTile;
         if (!tile.actor || tile.state === 'expired') {

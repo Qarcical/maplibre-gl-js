@@ -602,8 +602,11 @@ export class GeoJSONSource extends Evented implements Source {
             pixelRatio: this.map.getPixelRatio(),
             showCollisionBoxes: this.map.showCollisionBoxes,
             promoteId: this.promoteId,
-            subdivisionGranularity: this.map.style.projection.subdivisionGranularity
+            subdivisionGranularity: this.map.style.projection.subdivisionGranularity,
+            renderMode: this.map._decodeMode
         };
+        // PATCH (map2-fork): see vector_tile_source — mode this parse covers
+        tile.parsedMode = this.map._decodeMode;
 
         tile.abortController = new AbortController();
         const data = await this.actor.sendAsync(

@@ -488,4 +488,73 @@ describe('vector tile worker source', () => {
         expect(res).toBeDefined();
         expect(res.etagUnmodified).toBe(true);
     });
+
+    // PATCH (map2-fork): a mode-repair reload (Map#setDecodeMode) re-parses a tile so it
+    // gains the buckets its original mode skipped (map2:visible-when). The reload MUST
+    // adopt params.renderMode — reusing the WorkerTile's original mode made every repair
+    // re-emit the same mode-stripped buckets (2D return showed contour-less tiles).
+    test('VectorTileWorkerSource.reloadTile re-parses under the reload\'s render mode', async () => {
+        // an earlier test in this file spies on WorkerTile.prototype.parse and the
+        // afterEach clearAllMocks() does NOT restore implementations — undo it here
+        vi.restoreAllMocks();
+        const layerIndex = new StyleLayerIndex([{
+            id: 'contour',
+            source: 'source',
+            'source-layer': 'test',
+            type: 'circle',
+            metadata: {'map2:visible-when': '2d'}
+        }, {
+            id: 'roads',
+            source: 'source',
+            'source-layer': 'test',
+            type: 'circle'
+        }]);
+
+        const source = new VectorTileWorkerSource(actor, layerIndex, []);
+        source.loadVectorTile = (_params, _rawData) => {
+            return {
+                vectorTile: {
+                    layers: {
+                        test: {
+                            version: 2,
+                            name: 'test',
+                            extent: 8192,
+                            length: 1,
+                            feature: (featureIndex: number) => ({
+                                extent: 8192,
+                                type: 1,
+                                id: featureIndex,
+                                properties: {},
+                                loadGeometry () {
+                                    return [[new Point(0, 0)]];
+                                }
+                            })
+                        }
+                    }
+                },
+                rawData: new ArrayBuffer(0)
+            } as any;
+        };
+        server.respondWith(request => {
+            request.respond(200, {'Content-Type': 'application/pbf'}, new ArrayBuffer(0) as any);
+        });
+
+        const baseParams = {
+            source: 'source',
+            uid: 0,
+            tileID: {overscaledZ: 0, wrap: 0, canonical: {x: 0, y: 0, z: 0, w: 0}},
+            request: {url: 'http://localhost:2900/faketile.pbf'},
+            subdivisionGranularity: SubdivisionGranularitySetting.noSubdivision,
+        };
+
+        // parsed for 3D: the '2d'-tagged layer gets no bucket
+        const loadPromise = source.loadTile({...baseParams, renderMode: '3d'} as any as WorkerTileParameters);
+        server.respond();
+        const in3d = await loadPromise as WorkerTileWithData;
+        expect(in3d.buckets.map(b => b.layerIds[0])).toEqual(['roads']);
+
+        // the repair reload carries renderMode '2d' — the missing bucket must appear
+        const repaired = await source.reloadTile({...baseParams, renderMode: '2d'} as any as WorkerTileParameters) as WorkerTileWithData;
+        expect(repaired.buckets.map(b => b.layerIds[0]).sort()).toEqual(['contour', 'roads']);
+    });
 });

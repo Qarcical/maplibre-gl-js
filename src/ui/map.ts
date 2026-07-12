@@ -2435,10 +2435,18 @@ export class Map extends Camera {
                     if (e.source?.type === 'image') {
                         this.terrain.tileManager.freeRtt();
                     } else if (this.painter.renderToTexture) {
-                        // invalidate at stack granularity: only the render stacks that
-                        // drape this source are re-rendered, and only on terrain tiles
-                        // overlapping the changed tile
-                        this.painter.renderToTexture.markSourceTileChanged(e.sourceId, e.tile.tileID);
+                        if (e.tile.gatedUpload) {
+                            // upload spreading deferred this tile — a drape re-render
+                            // against a tile that refused to draw would be wasted, and
+                            // arrival-burst invalidation must ride the same pacing.
+                            // TileManager fires this when the upload is granted.
+                            e.tile.heldRttInvalidation = true;
+                        } else {
+                            // invalidate at stack granularity: only the render stacks that
+                            // drape this source are re-rendered, and only on terrain tiles
+                            // overlapping the changed tile
+                            this.painter.renderToTexture.markSourceTileChanged(e.sourceId, e.tile.tileID);
+                        }
                     } else {
                         this.terrain.tileManager.freeRtt(e.tile.tileID);
                     }
@@ -3802,7 +3810,12 @@ export class Map extends Camera {
         // Even though `_styleDirty` and `_sourcesDirty` are reset in this
         // method, synchronous events fired during Style.update or
         // Style._updateSources could have caused them to be set again.
-        const somethingDirty = this._sourcesDirty || this._styleDirty || this._placementDirty;
+        //
+        // Gated tile uploads left waiting by the scheduler also need another frame to
+        // drain (the budget floor guarantees forward progress every frame) — and while
+        // they drain the map isn't fully sharp, so `idle` correctly holds off too.
+        const somethingDirty = this._sourcesDirty || this._styleDirty || this._placementDirty ||
+            this.painter.uploadScheduler.pendingCount > 0;
         if (somethingDirty || this._repaint) {
             this.triggerRepaint();
         } else if (!this.isMoving() && this.loaded()) {
@@ -3925,6 +3938,9 @@ export class Map extends Camera {
                     }
                     this._lastRenderTimestamp = paintStartTimeStamp;
                     const cpuStart = performance.now();
+                    // budget the frame's gated tile uploads from the period the frame
+                    // actually has (governor cap, else the vsync estimate)
+                    this.painter.uploadScheduler.onFrameStart(this._effectiveFramePeriod());
                     try {
                         this._render(paintStartTimeStamp);
                     } catch(error) {
@@ -3932,11 +3948,15 @@ export class Map extends Camera {
                             throw error;
                         }
                     }
+                    const frameCpuMs = performance.now() - cpuStart;
+                    // feed the scheduler's base-frame-cost EMA (it subtracts its own
+                    // upload time, so sustained draining can't eat its own headroom)
+                    this.painter.uploadScheduler.onFrameEnd(frameCpuMs);
                     // glstats wants the fence measurements even under a fixed cap or
                     // uncapped — that's how a pinned-rate A/B shows whether the fence
                     // time is real GPU work or queue latency behind the governed pace
                     if (this._autoFrameRate || this._glStatsEnabled) {
-                        this._measureRenderedFrame(performance.now() - cpuStart);
+                        this._measureRenderedFrame(frameCpuMs);
                     }
                     if (this._autoFrameRate) {
                         this._maybeAdaptFrameRate();
@@ -4075,6 +4095,89 @@ export class Map extends Camera {
     }
 
     /**
+     * map2 fork: spread freshly-arrived tiles' GPU uploads across frames under a
+     * per-frame time budget derived from the frame period and the map's measured
+     * base frame cost (on by default). A deferred tile keeps drawing its covering
+     * parent/child — briefly coarser, never blank; per-frame anim sources and tiles
+     * with nothing renderable covering them bypass the budget. Disable to restore
+     * upload-everything-on-arrival (the `?nospread` A/B in the challenge app).
+     */
+    setUploadSpreading(on: boolean): this {
+        this.painter.uploadScheduler.enabled = !!on;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: the mode worker tile parses are dispatched for — layers tagged
+     * `map2:visible-when` for the other mode get no buckets built (see setDecodeMode).
+     */
+    _decodeMode: '2d' | '3d' = '2d';
+
+    /**
+     * map2 fork: set the render-side mode for `map2:visible-when`-tagged layers.
+     * Layers tagged for the other mode stop drawing, stop contributing RTT stack
+     * content and pool demand, and — for live layers — stop splitting draped stacks.
+     * The flip changes the stack signature (full RTT wipe), so call it at a boundary
+     * where a full re-render is in flight anyway (the app uses the exaggeration-ramp
+     * plateau, with hysteresis). Pair with {@link Map#setDecodeMode}.
+     */
+    setRenderMode(mode: '2d' | '3d'): this {
+        if (!this.painter || this.painter.renderMode === mode) return this;
+        this.painter.renderMode = mode;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: set the mode used for WORKER tile parses (`map2:visible-when`).
+     * Tiles parsed while a layer's mode is excluded skip that layer's bucket build,
+     * paint-array bake and eventual GL upload entirely — the decode-time cost that
+     * `?hide=contour,contour-index` measured as most of the 3D streaming upload bytes.
+     * Flipping back re-parses the in-view tiles that lack the new mode's layers; each
+     * keeps drawing its old buckets until the re-parse swaps in (state 'reloading'),
+     * so nothing blanks, and the resulting uploads arrive worker-staggered. Call at
+     * the START of the exit transition so workers get the transition as lead time.
+     */
+    setDecodeMode(mode: '2d' | '3d'): this {
+        if (this._decodeMode === mode) return this;
+        this._decodeMode = mode;
+        if (this.style) {
+            // repair only sources that actually have layers tagged for the NEW mode —
+            // tiles parsed under the other mode lack exactly those buckets
+            const sources = new Set<string>();
+            for (const id of this.style._order) {
+                const layer = this.style._layers[id];
+                if (layer?.source && layer.visibleWhen === mode) sources.add(layer.source);
+            }
+            let repairs = 0;
+            for (const sourceId of sources) {
+                repairs += this.style.tileManagers[sourceId]?.reloadTilesForMode(mode) ?? 0;
+            }
+            if (repairs > 0) {
+                // deliberately visible: mode-exit repair volume is a KPI (should be small
+                // on the zoomed-out 2D return, draining before the user zooms back in)
+                console.log(`[map2-fork] decode mode '${mode}': re-parsing ${repairs} tile(s) missing its layers`);
+            }
+        }
+        return this;
+    }
+
+    /**
+     * map2 fork: does the current decode mode show layers this source's mode-mismatched
+     * tiles are missing? Used by TileManager to catch parses that were already in
+     * flight when the decode mode flipped.
+     */
+    _modeRepairNeeded(sourceId: string): boolean {
+        if (!this.style) return false;
+        for (const id of this.style._order) {
+            const layer = this.style._layers[id];
+            if (layer?.source === sourceId && layer.visibleWhen === this._decodeMode) return true;
+        }
+        return false;
+    }
+
+    /**
      * Clip a line layer's rendering to the leading fraction of each feature's length.
      * Fragments beyond `progress` (0..1) are discarded in the shader, so animating a
      * line "growing" along its geometry costs one uniform per frame instead of a
@@ -4188,6 +4291,23 @@ export class Map extends Camera {
             }
         }
         this._pendingGpuFences = remaining;
+    }
+
+    /**
+     * The frame period the render loop is actually pacing to: the frame cap when one
+     * is set (fixed or governor-chosen), otherwise the display's vsync estimate.
+     * Feeds the upload scheduler's per-frame time budget — budgets scale with the
+     * period, so drain rate per second is rate-independent.
+     */
+    _effectiveFramePeriod(): number {
+        if (this._maxFrameInterval > 0) return this._maxFrameInterval;
+        if (this._rafDeltas.length >= 16) {
+            // median of the 16 smallest deltas ≈ the true display tick (see
+            // _maybeAdaptFrameRate); no need to snap to a canonical rate here
+            const sorted = [...this._rafDeltas].sort((a, b) => a - b);
+            return sorted[8];
+        }
+        return 1000 / 60;
     }
 
     _maybeAdaptFrameRate() {

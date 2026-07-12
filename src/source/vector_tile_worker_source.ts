@@ -209,6 +209,11 @@ export class VectorTileWorkerSource implements WorkerSource {
         if (!workerTile) throw new Error('Should not be trying to reload a tile that was never loaded or has been removed');
 
         workerTile.showCollisionBoxes = params.showCollisionBoxes;
+        // PATCH (map2-fork): adopt the reload's render mode — a mode-repair reload
+        // exists precisely to re-parse under the NEW mode; keeping the WorkerTile's
+        // original mode made every repair re-emit the same mode-stripped buckets
+        // (the 2D return showed contour-less tiles wherever a repair "ran")
+        workerTile.renderMode = params.renderMode;
 
         if (workerTile.status === 'parsing') {
             // if we are cancelling the original parse, make sure to pass the rawTileData from the original parse

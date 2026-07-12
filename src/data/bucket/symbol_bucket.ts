@@ -204,6 +204,20 @@ export class SymbolBuffers {
         }
 
         if (upload) {
+            // PATCH (map2-fork): under upload spreading a gated tile can reach its first
+            // upload BEFORE placement has ever run on it — the tile wasn't renderable
+            // during the placement pass, so updateBucketOpacities hasn't sized
+            // opacityVertexArray yet. The GL buffer is created at the array's current
+            // size and updateData can never resize it, so creating it empty crashes the
+            // next placement commit ("Length of new data is N, which doesn't match
+            // current length of 0"). Pre-fill with the packed hidden opacity (0), one
+            // entry per quad — exactly what a first updateBucketOpacities emits for an
+            // unplaced symbol; the symbols then fade in as any freshly placed tile does.
+            if (this.opacityVertexArray.length === 0 && this.layoutVertexArray.length > 0) {
+                for (let i = 0; i < this.layoutVertexArray.length / 4; i++) {
+                    this.opacityVertexArray.emplaceBack(0);
+                }
+            }
             this.layoutVertexBuffer = context.createVertexBuffer(this.layoutVertexArray, symbolLayoutAttributes.members);
             this.indexBuffer = context.createIndexBuffer(this.indexArray, dynamicIndexBuffer);
             this.dynamicLayoutVertexBuffer = context.createVertexBuffer(this.dynamicLayoutVertexArray, dynamicLayoutAttributes.members, true);

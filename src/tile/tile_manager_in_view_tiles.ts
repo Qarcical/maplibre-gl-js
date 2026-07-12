@@ -53,7 +53,9 @@ export class InViewTiles {
      */
     public getLoadedTile(tileID: OverscaledTileID): Tile | null {
         const tile = this.getTileById(tileID.key);
-        if (tile?.hasData()) {
+        // hasRenderableData, not hasData: a tile whose first upload the scheduler is
+        // still holding back can't substitute for anything (map2-fork upload spreading)
+        if (tile?.hasRenderableData()) {
             return tile;
         }
         return null;

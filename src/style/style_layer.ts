@@ -87,6 +87,13 @@ const ERROR_LAYOUT_NOT_PAINT = ' is a LAYOUT property not a PAINT property. Use 
 export abstract class StyleLayer extends Evented {
     id: string;
     metadata: unknown;
+    /**
+     * PATCH (map2-fork): `"map2:visible-when": "2d" | "3d"` layer metadata — a static
+     * mode tag. The painter and RTT stack machinery skip the layer when the map's
+     * render mode differs, and workers skip building its buckets when the decode mode
+     * differs (see Map#setRenderMode / Map#setDecodeMode). null = visible in any mode.
+     */
+    visibleWhen: '2d' | '3d' | null = null;
     type: LayerSpecification['type'] | CustomLayerInterface['type'];
     source: string;
     sourceLayer: string;
@@ -135,6 +142,8 @@ export abstract class StyleLayer extends Evented {
         layer = (layer as any as LayerSpecification);
 
         this.metadata = layer.metadata;
+        const visibleWhen = (layer.metadata as {[_: string]: unknown})?.['map2:visible-when'];
+        this.visibleWhen = visibleWhen === '2d' || visibleWhen === '3d' ? visibleWhen : null;
         this.minzoom = layer.minzoom;
         this.maxzoom = layer.maxzoom;
 

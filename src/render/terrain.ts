@@ -287,12 +287,16 @@ export class Terrain {
         const sourceTile = this.tileManager.getSourceTile(tileID, true);
         if (sourceTile?.dem && (!sourceTile.demTexture || sourceTile.needsTerrainPrepare)) {
             const context = this.painter.context;
+            const uploadStart = performance.now();
             // PATCH (map2-fork): R32F metres, shared tile.demTexture with hillshade/color-relief.
             // Never pooled (the painter's tile-texture pool is RGBA-only).
             if (sourceTile.demTexture) sourceTile.demTexture.update(sourceTile.dem.getFloatPixels(), {premultiply: false});
             else sourceTile.demTexture = new Texture(context, sourceTile.dem.getFloatPixels(), (context.gl as WebGL2RenderingContext).R32F, {premultiply: false});
             sourceTile.demTexture.bind(context.gl.NEAREST, context.gl.CLAMP_TO_EDGE);
             sourceTile.needsTerrainPrepare = false;
+            // a 16MB DEM upload spends the same main-thread time the upload scheduler
+            // budgets — debit it so a DEM-heavy frame grants fewer vector tiles
+            this.painter.uploadScheduler?.noteExternalUpload(performance.now() - uploadStart);
         }
         // create matrix for lookup in dem data
         const matrixKey = sourceTile && sourceTile.toString() + sourceTile.tileID.key + tileID.key;

@@ -59,6 +59,22 @@ export type GlStatsFrame = {
     bufferUploads: number;
     /** bytes uploaded by those buffer calls */
     bufferUploadBytes: number;
+    /** shader programs compiled+linked this frame (Painter.useProgram cache misses) */
+    programCompiles: number;
+    /**
+     * ms spent in those compiles — the constructor's COMPILE/LINK_STATUS queries force
+     * synchronous driver compilation, so this measures the real main-thread stall
+     * (first-3D frames compile a batch of terrain/RTT variants at once)
+     */
+    programCompileMs: number;
+    /** tiles whose gated first upload the scheduler granted this frame */
+    tileUploadsGranted: number;
+    /** gated tiles left waiting at frame end (drains at ~budget/emaTileMs per frame) */
+    tileUploadsDeferred: number;
+    /** ms the granted uploads actually took this frame */
+    tileUploadMs: number;
+    /** the scheduler's derived time budget for this frame (headroom-based, backlog-scaled) */
+    tileUploadBudgetMs: number;
 };
 
 function zeroFrame(): GlStatsFrame {
@@ -83,6 +99,12 @@ function zeroFrame(): GlStatsFrame {
         texUploadBytes: 0,
         bufferUploads: 0,
         bufferUploadBytes: 0,
+        programCompiles: 0,
+        programCompileMs: 0,
+        tileUploadsGranted: 0,
+        tileUploadsDeferred: 0,
+        tileUploadMs: 0,
+        tileUploadBudgetMs: 0,
     };
 }
 

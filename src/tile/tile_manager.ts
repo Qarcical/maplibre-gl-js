@@ -235,10 +235,113 @@ export class TileManager extends Evented {
         }
 
         this._state.coalesceChanges(this._inViewTiles, this.map ? this.map.painter : null);
+        const scheduler = this.map?.painter?.uploadScheduler;
+        let gated: Tile[] = null;
         for (const tile of this._inViewTiles.getAllTiles()) {
+            if (tile.gatedUpload) {
+                // PATCH (map2-fork): first upload of a freshly-arrived tile goes through
+                // the scheduler's per-frame budget below
+                if (scheduler?.enabled) {
+                    (gated ||= []).push(tile);
+                    continue;
+                }
+                tile.gatedUpload = false;   // spreading disabled — upload ungated
+            }
             tile.upload(context);
             tile.prepare(this.map.style.imageManager);
         }
+        if (gated) {
+            this._uploadGatedTiles(gated, context);
+        }
+    }
+
+    /**
+     * PATCH (map2-fork): upload freshly-arrived tiles under the scheduler's per-frame
+     * time budget — coarse zooms first (one parent unlocks a whole region's coverage),
+     * then viewport-centre-out. A denied tile stays non-renderable, so the retention
+     * machinery keeps drawing the covering parent/child; grants beyond the budget go
+     * to volatile (per-frame anim) sources and to tiles with no renderable substitute,
+     * where a deferral would lag the grow head or leave the region blank.
+     */
+    _uploadGatedTiles(gated: Tile[], context: Context) {
+        const scheduler = this.map.painter.uploadScheduler;
+        const volatile = scheduler.volatileSources.has(this.id);
+
+        if (gated.length > 1) {
+            let cx = 0.5, cy = 0.5;
+            if (this.transform) {
+                const c = MercatorCoordinate.fromLngLat(this.transform.center);
+                cx = c.x;
+                cy = c.y;
+            }
+            const dist: {[uid: number]: number} = {};
+            for (const tile of gated) {
+                const id = tile.tileID.canonical;
+                const scale = 1 << id.z;
+                const dx = (id.x + 0.5) / scale + tile.tileID.wrap - cx;
+                const dy = (id.y + 0.5) / scale - cy;
+                dist[tile.uid] = dx * dx + dy * dy;
+            }
+            gated.sort((a, b) => a.tileID.overscaledZ - b.tileID.overscaledZ || dist[a.uid] - dist[b.uid]);
+        }
+
+        for (const tile of gated) {
+            // budget check first — the substitute scan only runs once the budget is spent
+            if (!volatile && !scheduler.hasBudget() && this._hasRenderableSubstitute(tile.tileID)) {
+                scheduler.noteDeferred();
+                continue;
+            }
+            const start = performance.now();
+            tile.upload(context);
+            tile.prepare(this.map.style.imageManager);
+            scheduler.noteGranted(performance.now() - start);
+            tile.gatedUpload = false;
+            if (tile.heldRttInvalidation) {
+                tile.heldRttInvalidation = false;
+                // arrival invalidation deferred to the grant: drapes re-render against
+                // this tile only now that it can actually draw
+                this.map.painter.renderToTexture?.markSourceTileChanged(this.id, tile.tileID);
+            }
+        }
+    }
+
+    /**
+     * PATCH (map2-fork): re-parse in-view tiles that were parsed under a different render
+     * mode and therefore lack buckets for layers the new mode shows (map2:visible-when).
+     * 'reloading' keeps each tile's old buckets drawing until its re-parse swaps in, so
+     * nothing blanks; results arrive worker-staggered rather than as one burst.
+     * @returns how many tiles were queued for repair
+     */
+    reloadTilesForMode(mode: '2d' | '3d'): number {
+        let repairs = 0;
+        for (const id of this._inViewTiles.getAllIds()) {
+            const tile = this._inViewTiles.getTileById(id);
+            if (tile.parsedMode && tile.parsedMode !== mode && tile.hasData() && tile.state !== 'reloading') {
+                this._reloadTile(id, 'reloading');
+                repairs++;
+            }
+        }
+        return repairs;
+    }
+
+    /**
+     * PATCH (map2-fork): is anything renderable covering this tile's area — an ancestor,
+     * or at least one renderable descendant (partial coverage counts: the region isn't
+     * blank)? Used to decide whether deferring the tile's upload is safe.
+     */
+    _hasRenderableSubstitute(tileID: OverscaledTileID): boolean {
+        for (let z = tileID.overscaledZ - 1; z >= this._source.minzoom; z--) {
+            const parent = this._inViewTiles.getTileById(tileID.scaledTo(z).key);
+            if (parent?.isRenderable(false)) {
+                return true;
+            }
+        }
+        for (const tile of this._inViewTiles.getAllTiles()) {
+            if (tile.tileID.overscaledZ > tileID.overscaledZ && tile.isRenderable(false) && tile.tileID.isChildOf(tileID)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -332,6 +435,26 @@ export class TileManager extends Evented {
         }
         this._state.initializeTileState(tile, this.map ? this.map.painter : null);
 
+        // PATCH (map2-fork): a parse dispatched BEFORE a decode-mode flip lacks the layers
+        // the new mode shows — the flip-time repair pass couldn't reload it (it was in
+        // flight), so catch it on arrival. The re-parse is stamped with the current mode,
+        // so this can't loop.
+        if (tile.parsedMode && this.map && tile.parsedMode !== this.map._decodeMode &&
+            this.map._modeRepairNeeded(this.id)) {
+            this._reloadTile(id, 'reloading');
+        }
+
+        // PATCH (map2-fork): fresh arrivals with GPU upload work go through the painter's
+        // upload scheduler (prepare() grants them under a per-frame time budget) instead of
+        // uploading everything the frame a batch lands. Reloads are never gated:
+        // loadVectorData already destroyed the old buckets, so deferring a reload would
+        // blank content that was on screen (and per-frame setData sources must never lag).
+        // Set before the data event fires so Map's terrain callback can hold the RTT
+        // invalidation back until the grant.
+        if (previousState === 'loading' && this.map?.painter?.uploadScheduler?.enabled && tile.hasPendingUploads()) {
+            tile.gatedUpload = true;
+        }
+
         if (!tile.aborted) {
             this._source.fire(new Event('data', {dataType: 'source', tile, coord: tile.tileID}));
         }
@@ -417,7 +540,8 @@ export class TileManager extends Evented {
         const loadedDescendents: Record<string, Tile[]> = {};
 
         // enumerate current tiles and find the loaded descendents of each target tile
-        for (const tile of this._inViewTiles.getAllTiles().filter(tile => tile.hasData())) {
+        // (hasRenderableData: an upload-gated tile can't substitute — map2-fork)
+        for (const tile of this._inViewTiles.getAllTiles().filter(tile => tile.hasRenderableData())) {
             // determine if the loaded tile (hasData) is a qualified descendent of any target tile
             for (const targetID of targetTileIDs) {
                 if (tile.tileID.isChildOf(targetID)) {
@@ -770,7 +894,9 @@ export class TileManager extends Evented {
         for (const idealID of idealTileIDs) {
             const idealTile = this._addTile(idealID);
 
-            if (!idealTile.hasData()) {
+            // hasRenderableData: an ideal tile whose upload is still gated needs its
+            // substitutes retained exactly as if it were still loading (map2-fork)
+            if (!idealTile.hasRenderableData()) {
                 idealTilesWithoutData.add(idealID);
             }
         }
@@ -802,7 +928,9 @@ export class TileManager extends Evented {
                     tile = this._addTile(parentId);
                 }
                 if (tile) {
-                    const hasData = tile.hasData();
+                    // hasRenderableData: keep ascending past an upload-gated parent — it
+                    // can't draw yet, so a renderable ancestor is still needed (map2-fork)
+                    const hasData = tile.hasRenderableData();
                     if (hasData || !this.map?.cancelPendingTileRequestsWhileZooming || parentWasRequested) {
                         retainTileMap[parentId.key] = parentId;
                     }
@@ -850,6 +978,17 @@ export class TileManager extends Evented {
         this._inViewTiles.setTile(tileID.key, tile);
         if (!cached) {
             this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
+        }
+
+        // PATCH (map2-fork): a tile promoted from the cache (or a preload pin) may have
+        // been parsed under a render mode that skipped layers the CURRENT decode mode
+        // shows (map2:visible-when) — e.g. cached during a 3D flight, re-entering view
+        // after the 2D return. The flip-time repair pass only sees in-view tiles, so
+        // catch these here; old buckets keep drawing until the re-parse swaps in.
+        if (cached && tile.parsedMode && this.map &&
+            tile.parsedMode !== this.map._decodeMode && this.map._modeRepairNeeded(this.id) &&
+            tile.hasData() && tile.state !== 'reloading') {
+            this._reloadTile(tileID.key, 'reloading');
         }
 
         return tile;

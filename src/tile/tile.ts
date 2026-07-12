@@ -127,6 +127,27 @@ export class Tile {
      */
     rtt: Array<{pool: number; id: number; stamp: number; dirty?: boolean} | null>;
     rttFingerprint: {[sourceId:string]: string};
+    /**
+     * PATCH (map2-fork): this tile's first GPU upload is gated behind the painter's
+     * UploadScheduler (set on fresh loads in TileManager._tileLoaded). While set the
+     * tile is not renderable and reports no data to the retention machinery, so the
+     * covering parent/child keeps drawing until the scheduler grants the upload.
+     */
+    gatedUpload: boolean = false;
+    /**
+     * PATCH (map2-fork): a draped-source arrival invalidation that Map's terrain data
+     * callback held back because this tile's upload was gated — fired (as a tile-scoped
+     * markSourceTileChanged) when the upload is granted, so drapes never re-render
+     * against a tile that refused to draw.
+     */
+    heldRttInvalidation: boolean = false;
+    /**
+     * PATCH (map2-fork): the render mode this tile's worker parse was dispatched for —
+     * layers whose `map2:visible-when` excludes it have NO buckets in this tile.
+     * Stamped at request time by the vector/geojson sources; Map#setDecodeMode re-parses
+     * tiles whose parsedMode lacks the new mode's layers. undefined = parsed everything.
+     */
+    parsedMode: '2d' | '3d' | undefined;
 
     /**
      * @param tileID - the tile ID
@@ -158,6 +179,7 @@ export class Tile {
     isRenderable(symbolLayer: boolean): boolean {
         return (
             this.hasData() &&
+            !this.gatedUpload &&                            // upload spreading (map2-fork)
             (!this.fadeEndTime || this.fadeOpacity > 0) &&  // raster fading
             (symbolLayer || !this.holdingForSymbolFade())   // symbol fading
         );
@@ -314,6 +336,8 @@ export class Tile {
         this.dashPositions = null;
         this.latestFeatureIndex = null;
         this.state = 'unloaded';
+        this.gatedUpload = false;
+        this.heldRttInvalidation = false;
     }
 
     getBucket(layer: StyleLayer) {
@@ -409,6 +433,23 @@ export class Tile {
 
     hasData() {
         return this.state === 'loaded' || this.state === 'reloading' || this.state === 'expired';
+    }
+
+    /**
+     * PATCH (map2-fork): hasData, minus tiles whose first GPU upload the scheduler is
+     * still holding back. The retention machinery keys off this: a gated tile counts
+     * as "still loading" so its covering parent/child stays retained and drawing.
+     */
+    hasRenderableData() {
+        return this.hasData() && !this.gatedUpload;
+    }
+
+    /** PATCH (map2-fork): any GPU upload work outstanding (buckets or atlas textures)? */
+    hasPendingUploads(): boolean {
+        for (const id in this.buckets) {
+            if (this.buckets[id].uploadPending()) return true;
+        }
+        return !!((this.imageAtlas && !this.imageAtlas.uploaded) || this.glyphAtlasImage);
     }
 
     patternsLoaded() {
