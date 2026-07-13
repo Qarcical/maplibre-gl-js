@@ -310,7 +310,8 @@ export class LineBucket implements Bucket {
             0;
 
         // we could be more precise, but it would only save a negligible amount of space
-        const segment = this.segments.prepareSegment(len * 10, this.layoutVertexArray, this.indexArray);
+        const estimatedVertices = len * 10;
+        const segment = this.segments.prepareSegment(estimatedVertices, this.layoutVertexArray, this.indexArray);
 
         let currentVertex: Point;
         let prevVertex: Point;
@@ -513,6 +514,19 @@ export class LineBucket implements Bucket {
                     currentVertex = newCurrentVertex;
                 }
             }
+        }
+
+        // map2 fork: when the conservative ×10 estimate tripped the segment-overflow
+        // warning, report the ACTUAL vertex count for the feature — 16-bit index
+        // corruption only occurs past MAX_VERTEX_ARRAY_LENGTH REAL vertices, and the
+        // estimate over-counts ~3–5× (typ. 2/point + join extras). First trip:
+        // composite/coast-line@z5 estimated 66540 (≈6654 points) — this line settles
+        // whether that is a false alarm or needs a mid-feature segment split.
+        if (estimatedVertices > SegmentVector.MAX_VERTEX_ARRAY_LENGTH) {
+            const over = segment.vertexLength > SegmentVector.MAX_VERTEX_ARRAY_LENGTH;
+            console.log(`[map2-fork] large line feature: estimated ${estimatedVertices}, actual ${segment.vertexLength} vertices` +
+                `${SegmentVector.bucketContext ? ` [${SegmentVector.bucketContext}]` : ''}` +
+                `${over ? ' — EXCEEDS the 16-bit index limit, rendering IS corrupt for this feature' : ' (within the 16-bit limit — no corruption)'}`);
         }
     }
 
