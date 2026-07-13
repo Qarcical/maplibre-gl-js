@@ -40,6 +40,19 @@ const MAX_POOL_BYTES = 512 * 1024 * 1024;
  */
 const SOFT_RERENDERS_PER_FRAME = 6;
 
+/**
+ * Shrink-to-demand tuning (see RenderPool#shrink). Headroom above the frame's demand
+ * absorbs demand oscillation; the idle threshold (~5s at 60fps — pool frames only
+ * advance while rendering, which is when memory matters) keeps recently-cached
+ * entries alive so a released object is one the working set genuinely left behind;
+ * the per-frame release cap bounds the GL-delete work in any one frame. Released
+ * objects go to the painter's byte-capped stash first, so a demand swing that
+ * re-grows the pool adopts them back instead of paying an 8–99ms allocation.
+ */
+const POOL_SHRINK_HEADROOM = 4;
+const POOL_SHRINK_IDLE_FRAMES = 300;
+const POOL_SHRINK_MAX_PER_FRAME = 2;
+
 function getPoolBudgetBytes(): number {
     // navigator.deviceMemory is Chromium-only and reports at most 8 — treat 8 as
     // "desktop-class" and allow a larger texture budget there
@@ -131,10 +144,16 @@ export class RenderToTexture {
         const fullTileSize = terrain.tileManager.tileSize * terrain.qualityFactor;
         const halfTileSize = terrain.tileManager.tileSize;
         if (!painter._poolWarmTargets || painter._poolWarmTargets[0]?.size !== fullTileSize) {
-            painter._poolWarmTargets = [
-                {size: fullTileSize, count: painter._poolWarmTargets?.[0]?.count ?? 14},
-                {size: halfTileSize, count: painter._poolWarmTargets?.[1]?.count ?? 6}
-            ];
+            const fullCount = painter._poolWarmTargets?.[0]?.count ?? 14;
+            const halfCount = painter._poolWarmTargets?.[1]?.count ?? 6;
+            // at qualityFactor 1 both tiers are the same pixel size — one merged target,
+            // or warmPoolObject's per-size stash counting would satisfy both at once
+            painter._poolWarmTargets = fullTileSize === halfTileSize ?
+                [{size: fullTileSize, count: fullCount + halfCount}] :
+                [
+                    {size: fullTileSize, count: fullCount},
+                    {size: halfTileSize, count: halfCount}
+                ];
         }
         this.pools = [
             new RenderPool(painter.context, 30, fullTileSize, painter),
@@ -150,7 +169,9 @@ export class RenderToTexture {
 
     getTexture(tile: Tile): Texture {
         const entry = tile.rtt[this._stacks.length - 1];
-        return this.pools[entry.pool].getObjectForId(entry.id).texture;
+        // entries composited this frame were used this frame, so shrink (which only
+        // releases objects idle for many frames) can never have taken their object
+        return this.pools[entry.pool].getObjectForId(entry.id)!.texture;
     }
 
     /**
@@ -350,6 +371,18 @@ export class RenderToTexture {
         for (let tier = 0; tier < this.pools.length; tier++) {
             this.pools[tier].setSize(Math.max(30, demand[tier]));
         }
+        // Demand-following pool: without this the pool population is grow-only and
+        // plateaus at peak-EVER demand for the session (iPhone climbs: 688MB resident
+        // against a 20–55 object working set — the crash-margin driver). Release the
+        // surplus back to the stash/GPU once it's been idle long enough to be outside
+        // the working set. Disable via Map#setPoolShrink (`?noshrink` in the app).
+        if (style.map?._poolShrinkToDemand !== false) {
+            for (let tier = 0; tier < this.pools.length; tier++) {
+                const freed = this.pools[tier].shrink(
+                    demand[tier] + POOL_SHRINK_HEADROOM, POOL_SHRINK_IDLE_FRAMES, POOL_SHRINK_MAX_PER_FRAME);
+                if (freed && glStats.enabled) glStats.frame.poolFrees += freed;
+            }
+        }
         if (glStats.enabled) {
             glStats.frame.rttPoolSlots = this.pools[0].size + this.pools[1].size;
             glStats.frame.rttPoolDemand = demand[0] + demand[1];
@@ -465,8 +498,10 @@ export class RenderToTexture {
             let refreshInPlace = false;
             const cached = tile.rtt[stack];
             if (cached?.pool === tier) {
+                // the object may be gone (released by shrink-to-demand) — treat like
+                // a stamp mismatch and re-render into a fresh object
                 const cachedObj = pool.getObjectForId(cached.id);
-                if (cachedObj.stamp === cached.stamp) {
+                if (cachedObj && cachedObj.stamp === cached.stamp) {
                     if (!cached.dirty) {
                         pool.useObject(cachedObj);
                         if (glStats.enabled) glStats.frame.rttTilesReused++;
@@ -494,8 +529,12 @@ export class RenderToTexture {
                 glStats.frame.rttTilesRendered++;
                 if (refreshInPlace) glStats.frame.rttTilesRefreshed++;
                 // a surviving cache entry whose pool object was recycled = eviction
-                // (over-subscription); no entry at all = invalidation or first render
-                else if (cached) glStats.frame.rttTilesEvicted++;
+                // (over-subscription — the thrash KPI, must stay 0 in steady state);
+                // an entry whose object was RELEASED by shrink-to-demand left the
+                // working set long ago, so its re-render on return counts as an
+                // invalidation, like any dropped entry; no entry at all = invalidation
+                // or first render
+                else if (cached && pool.getObjectForId(cached.id)) glStats.frame.rttTilesEvicted++;
                 else glStats.frame.rttTilesInvalidated++;
                 glStats.inRtt = true;
             }

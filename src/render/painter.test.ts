@@ -82,6 +82,42 @@ describe('tile texture pool', () => {
     });
 });
 
+// PATCH (map2-fork): the pool-object stash is byte-capped, not count-capped — stash
+// residents are exactly the memory the iOS jetsam ceiling cares about, and the old
+// count cap (96) allowed 1.6GB of 16.8MB full-tier objects in theory.
+describe('pool stash byte cap', () => {
+    function stubPair() {
+        return {fbo: {destroy: vi.fn()} as any, texture: {destroy: vi.fn()} as any};
+    }
+
+    test('stash refuses past the byte budget, take releases bytes, trim enforces a lowered budget', () => {
+        const gl = document.createElement('canvas').getContext('webgl');
+        const transform = new MercatorTransform({minZoom: 0, maxZoom: 22, minPitch: 0, maxPitch: 60, renderWorldCopies: true});
+        const painter = new Painter(gl, transform);
+        const objectBytes = 512 * 512 * 4;
+        painter._poolStashMaxBytes = objectBytes * 2;
+
+        const [a, b, c] = [stubPair(), stubPair(), stubPair()];
+        expect(painter.stashPoolObject(512, a.fbo, a.texture)).toBe(true);
+        expect(painter.stashPoolObject(512, b.fbo, b.texture)).toBe(true);
+        // budget full — the third object must be refused (caller destroys it)
+        expect(painter.stashPoolObject(512, c.fbo, c.texture)).toBe(false);
+        expect(painter._poolStashBytes).toBe(objectBytes * 2);
+
+        // taking an entry releases its bytes
+        expect(painter.takePoolStash(512)).not.toBeNull();
+        expect(painter._poolStashBytes).toBe(objectBytes);
+        expect(painter.stashPoolObject(512, c.fbo, c.texture)).toBe(true);
+
+        // lowering the budget trims (newest first) and destroys what it evicts
+        painter._poolStashMaxBytes = objectBytes;
+        painter.trimPoolStash();
+        expect(painter._poolStashBytes).toBe(objectBytes);
+        expect(painter._poolStash).toHaveLength(1);
+        expect(c.texture.destroy).toHaveBeenCalled();
+    });
+});
+
 // PATCH (map2-fork): idle-time terrain shader warm-up — record 2D compiles, then
 // pre-compile their /terrain twins (plus the pure terrain programs) one at a time
 // so the first terrain frame finds a warm cache (see Map#precompileTerrainPrograms).

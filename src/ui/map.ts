@@ -27,7 +27,7 @@ import {type Source} from '../source/source';
 import {type StyleLayer} from '../style/style_layer';
 import {Terrain} from '../render/terrain';
 import {RenderToTexture} from '../webgl/render_to_texture';
-import {glStats, summarizeGlStats, type GlStatsFrame} from '../webgl/gl_stats';
+import {glStats, glMem, summarizeGlStats, type GlStatsFrame} from '../webgl/gl_stats';
 import {config} from '../util/config';
 import {defaultLocale} from './default_locale';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
@@ -579,6 +579,18 @@ export class Map extends Camera {
      * {@link Map#setLowResLineStacks}.
      */
     _lowResLineStacks: boolean = false;
+    /**
+     * map2 fork: RTT texture resolution multiplier override (0 = maplibre's default
+     * 2). 1 renders draped stacks at the terrain tile size — 4× less pool memory and
+     * 4× less RTT fill — the Reduced quality profile for memory/thermally constrained
+     * devices. See {@link Map#setTerrainQualityFactor}.
+     */
+    _terrainQualityFactor: number = 0;
+    /**
+     * map2 fork: release idle RTT pool objects back to demand (+headroom) instead of
+     * holding the session's peak-ever population. See {@link Map#setPoolShrink}.
+     */
+    _poolShrinkToDemand: boolean = true;
     _autoFrameRate: boolean = false;
     _rafDeltas: number[] = [];
     _lastRafTimestamp: number = -Infinity;
@@ -2397,6 +2409,9 @@ export class Map extends Camera {
                 }
             }
             this.terrain = new Terrain(this.painter, tileManager, options);
+            // map2 fork: constrained-device RTT resolution override — must land before
+            // RenderToTexture reads it to size the pools (see setTerrainQualityFactor)
+            if (this._terrainQualityFactor) this.terrain.qualityFactor = this._terrainQualityFactor;
             this.painter.renderToTexture = new RenderToTexture(this.painter, this.terrain);
             this.transform.setMinElevationForCurrentTile(this.terrain.getMinTileElevationForLngLatZoom(this.transform.center, this.transform.tileZoom));
             if (this._centerClampedToGround) {
@@ -4068,11 +4083,26 @@ export class Map extends Camera {
             };
             this._glStatsPerf = [];
         }
+        // Resident GPU memory snapshot (gauge, not per-frame): the iPhone crash-hunt
+        // readout — iOS Safari jetsam-kills a tab around ~1-1.5GB with no error, so
+        // watch which category grows. heapMB only exists on Chromium.
+        const mb = (b: number) => Math.round(b / 1048576);
+        const perfMemory = (performance as unknown as {memory?: {usedJSHeapSize: number}}).memory;
+        const mem = {
+            texMB: mb(glMem.texBytes),
+            demMB: mb(glMem.demBytes),
+            poolMB: mb(glMem.poolBytes),
+            bufMB: mb(glMem.bufferBytes),
+            texCount: glMem.texCount,
+            bufferCount: glMem.bufferCount,
+            heapMB: perfMemory ? mb(perfMemory.usedJSHeapSize) : undefined,
+        };
         this.fire(new Event('glstats', {
             frames: this._glStatsFrames.length,
             median,
             max,
             framePerf,
+            mem,
         }));
         // keep the last frame so getGlStats stays readable between reports
         this._glStatsFrames = [this._glStatsFrames[this._glStatsFrames.length - 1]];
@@ -4102,6 +4132,56 @@ export class Map extends Camera {
     setLowResLineStacks(on: boolean): this {
         this._lowResLineStacks = !!on;
         this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: override the terrain render-to-texture resolution multiplier
+     * (maplibre's default is 2: draped stacks render at twice the terrain tile size).
+     * A factor of 1 renders them at the terrain tile size — each pool texture drops
+     * to a quarter of the bytes (2048²→1024² = 16.8→4.2MB with 512px DEM tiles) and
+     * RTT re-renders fill a quarter of the pixels, the two dominant costs on
+     * memory/thermally constrained devices (the iPhone crash regime: a 688MB
+     * grow-only pool riding under the iOS tab-kill line). Softness of the draped
+     * basemap is the trade — needs eyes-on per device class. Power of two, 1..4.
+     * If terrain is installed the change re-installs it (full RTT rebuild).
+     */
+    setTerrainQualityFactor(factor: number): this {
+        const clamped = factor === 1 || factor === 2 || factor === 4 ? factor : 2;
+        if (this._terrainQualityFactor === clamped) return this;
+        this._terrainQualityFactor = clamped;
+        if (this.terrain) {
+            const options = this.terrain.options;
+            this.setTerrain(null);
+            this.setTerrain(options);
+        }
+        return this;
+    }
+
+    /**
+     * map2 fork: byte budget for the painter's pool-object stash — the pre-allocated
+     * / preserved RTT framebuffer+texture pairs that make first 3D entries and
+     * 2D↔3D round trips cheap. The stash is resident GPU memory, so on constrained
+     * devices it must be small (its default is deviceMemory-derived: 512MB
+     * desktop-class, 192MB otherwise). Lowering the budget trims an over-budget
+     * stash immediately.
+     */
+    setPoolStashBudget(megabytes: number): this {
+        this.painter._poolStashMaxBytes = Math.max(0, megabytes) * 1024 * 1024;
+        this.painter.trimPoolStash();
+        return this;
+    }
+
+    /**
+     * map2 fork: enable/disable RTT pool shrink-to-demand (on by default). When on,
+     * pool objects idle for ~5s beyond the frame's demand (+headroom) are released
+     * to the byte-capped stash or destroyed, so pool memory follows the working set
+     * instead of plateauing at the session's peak-ever demand (measured 688MB on
+     * iPhone against a 20–55 object working set). Off restores the grow-only
+     * behaviour (the `?noshrink` A/B in the challenge app).
+     */
+    setPoolShrink(on: boolean): this {
+        this._poolShrinkToDemand = !!on;
         return this;
     }
 
@@ -4234,17 +4314,29 @@ export class Map extends Camera {
      * working set for the first tilt is allocated ahead of time; terrain uninstall
      * returns the live pool's objects to the stash, making 3D re-entries free too.
      * Sizes are derived from the DEM source's tileSize (terrain ladder ×2, full RTT
-     * tier ×qualityFactor 2) until a real terrain install records the exact values.
+     * tier × the quality factor) until a real terrain install records the exact values.
      */
     prewarmTerrainPool(fullCount: number = 14, halfCount: number = 6, demSourceId?: string): this {
         if (!this.painter) return this;
         if (!this.painter._poolWarmTargets) {
             const source = demSourceId ? this.style?.getSource(demSourceId) : null;
             const sourceTileSize = (source as {tileSize?: number})?.tileSize ?? 512;
-            this.painter._poolWarmTargets = [
-                {size: sourceTileSize * 4, count: fullCount},
-                {size: sourceTileSize * 2, count: halfCount}
-            ];
+            // terrain ladder tileSize = source tileSize ×2; full RTT tier = ladder ×
+            // qualityFactor (2 default, may be overridden — see setTerrainQualityFactor).
+            // At factor 1 both tiers share one pixel size — merge them, or the
+            // per-size stash counting in warmPoolObject would satisfy both at once.
+            const qualityFactor = this._terrainQualityFactor || 2;
+            const fullSize = sourceTileSize * 2 * qualityFactor;
+            const halfSize = sourceTileSize * 2;
+            this.painter._poolWarmTargets = fullSize === halfSize ?
+                [{size: fullSize, count: fullCount + halfCount}] :
+                [
+                    {size: fullSize, count: fullCount},
+                    {size: halfSize, count: halfCount}
+                ];
+        } else if (this.painter._poolWarmTargets.length === 1) {
+            // merged single-size target (qualityFactor 1)
+            this.painter._poolWarmTargets[0].count = fullCount + halfCount;
         } else {
             this.painter._poolWarmTargets[0].count = fullCount;
             if (this.painter._poolWarmTargets[1]) this.painter._poolWarmTargets[1].count = halfCount;

@@ -159,6 +159,15 @@ export class Painter {
      * first entry alike find their working set ready.
      */
     _poolStash: Array<{size: number; fbo: Framebuffer; texture: Texture}>;
+    /**
+     * map2 fork: resident bytes held by _poolStash, capped by _poolStashMaxBytes. The
+     * cap is byte-based, not count-based — the old count cap (96) allowed 1.6GB of
+     * 16.8MB full-tier objects in theory, and stash residents are exactly the memory
+     * the iPhone jetsam ceiling cares about. Objects the stash won't take are
+     * destroyed (RenderPool.destruct / shrink fall through to destroy).
+     */
+    _poolStashBytes: number;
+    _poolStashMaxBytes: number;
     /** map2 fork: how many pool objects of each pixel size the idle warm-up should hold ready */
     _poolWarmTargets: Array<{size: number; count: number}> | null;
 
@@ -179,6 +188,13 @@ export class Painter {
         this._terrainWarmRecording = false;
         this._terrainWarmPending = [];
         this._poolStash = [];
+        this._poolStashBytes = 0;
+        // desktop-class devices (Chromium deviceMemory reports 8 = "8 or more") can
+        // afford holding most of a 3D working set between installs; everything else —
+        // including iOS Safari, which reports nothing — gets a tight default. The
+        // challenge app's device profile overrides via Map#setPoolStashBudget.
+        const deviceMemory = typeof navigator !== 'undefined' ? (navigator as {deviceMemory?: number}).deviceMemory : undefined;
+        this._poolStashMaxBytes = (deviceMemory >= 8 ? 512 : 192) * 1024 * 1024;
         this._poolWarmTargets = null;
 
         this.setup();
@@ -889,17 +905,30 @@ export class Painter {
         for (let i = 0; i < this._poolStash.length; i++) {
             if (this._poolStash[i].size === size) {
                 const [entry] = this._poolStash.splice(i, 1);
+                this._poolStashBytes -= size * size * 4;
                 return entry;
             }
         }
         return null;
     }
 
-    /** map2 fork: keep a destructed pool object's GPU resources for the next install */
+    /** map2 fork: keep a destructed/shrunk pool object's GPU resources for the next use (byte-capped) */
     stashPoolObject(size: number, fbo: Framebuffer, texture: Texture): boolean {
-        if (this._poolStash.length >= 96) return false;
+        const bytes = size * size * 4;
+        if (this._poolStashBytes + bytes > this._poolStashMaxBytes) return false;
         this._poolStash.push({size, fbo, texture});
+        this._poolStashBytes += bytes;
         return true;
+    }
+
+    /** map2 fork: destroy stash entries until the stash fits its byte budget (newest first) */
+    trimPoolStash() {
+        while (this._poolStashBytes > this._poolStashMaxBytes && this._poolStash.length > 0) {
+            const entry = this._poolStash.pop();
+            this._poolStashBytes -= entry.size * entry.size * 4;
+            entry.texture.destroy();
+            entry.fbo.destroy();
+        }
     }
 
     /**
@@ -913,16 +942,20 @@ export class Painter {
         for (const target of this._poolWarmTargets) {
             const have = this._poolStash.reduce((n, entry) => n + (entry.size === target.size ? 1 : 0), 0);
             if (have >= target.count) continue;
+            // the stash byte budget bounds warming too — on a constrained profile a
+            // partial warm set is the intended trade (the rest allocates on demand)
+            if (this._poolStashBytes + target.size * target.size * 4 > this._poolStashMaxBytes) continue;
             const allocStart = performance.now();
             const gl = this.context.gl;
             const fbo = this.context.createFramebuffer(target.size, target.size, true, true);
-            const texture = new Texture(this.context, {width: target.size, height: target.size, data: null}, gl.RGBA);
+            const texture = new Texture(this.context, {width: target.size, height: target.size, data: null}, gl.RGBA, {poolTexture: true});
             texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE);
             if (this.context.extTextureFilterAnisotropic) {
                 gl.texParameterf(gl.TEXTURE_2D, this.context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this.context.extTextureFilterAnisotropicMax);
             }
             fbo.colorAttachment.set(texture.texture);
             this._poolStash.push({size: target.size, fbo, texture});
+            this._poolStashBytes += target.size * target.size * 4;
             const allocMs = performance.now() - allocStart;
             if (glStats.enabled && allocMs > 8) {
                 console.log(`[map2-fork] slow pool alloc (warm): ${target.size}px ${allocMs.toFixed(1)}ms`);
@@ -977,6 +1010,7 @@ export class Painter {
             entry.fbo.destroy();
         }
         this._poolStash = [];
+        this._poolStashBytes = 0;
         if (this._tileTextures) {
             for (const size in this._tileTextures) {
                 const textures = this._tileTextures[size];

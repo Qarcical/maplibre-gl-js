@@ -2,7 +2,7 @@
 import type {StructArray} from '../util/struct_array';
 import type {TriangleIndexArray, LineIndexArray, LineStripIndexArray} from '../data/index_array_type';
 import type {Context} from './context';
-import {glStats} from './gl_stats';
+import {glStats, glMem} from './gl_stats';
 
 /**
  * @internal
@@ -12,6 +12,9 @@ export class IndexBuffer {
     context: Context;
     buffer: WebGLBuffer;
     dynamicDraw: boolean;
+
+    // PATCH (map2-fork): resident-memory accounting (see glMem in gl_stats.ts)
+    private _memBytes: number = 0;
 
     constructor(context: Context, array: TriangleIndexArray | LineIndexArray | LineStripIndexArray, dynamicDraw?: boolean) {
         this.context = context;
@@ -26,6 +29,9 @@ export class IndexBuffer {
 
         context.bindElementBuffer.set(this.buffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, array.arrayBuffer, this.dynamicDraw ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+        this._memBytes = array.arrayBuffer.byteLength;
+        glMem.bufferBytes += this._memBytes;
+        glMem.bufferCount++;
         if (glStats.enabled) {
             glStats.frame.bufferUploads++;
             glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
@@ -59,6 +65,10 @@ export class IndexBuffer {
         if (this.buffer) {
             gl.deleteBuffer(this.buffer);
             delete this.buffer;
+            // PATCH (map2-fork): resident accounting
+            glMem.bufferBytes -= this._memBytes;
+            glMem.bufferCount--;
+            this._memBytes = 0;
         }
     }
 }

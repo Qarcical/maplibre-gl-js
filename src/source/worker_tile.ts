@@ -7,6 +7,7 @@ import {LineBucket} from '../data/bucket/line_bucket';
 import {FillBucket} from '../data/bucket/fill_bucket';
 import {FillExtrusionBucket} from '../data/bucket/fill_extrusion_bucket';
 import {warnOnce, mapObject} from '../util/util';
+import {SegmentVector} from '../data/segment';
 import {ImageAtlas} from '../render/image_atlas';
 import {GlyphAtlas} from '../render/glyph_atlas';
 import {EvaluationParameters} from '../style/evaluation_parameters';
@@ -130,7 +131,10 @@ export class WorkerTile {
                     sourceID: this.source
                 });
 
+                // PATCH (map2-fork): name the culprit if populate overflows a segment
+                SegmentVector.bucketContext = `${this.source}/${layer.id}@z${this.tileID.canonical.z}`;
                 bucket.populate(features, options, this.tileID.canonical);
+                SegmentVector.bucketContext = null;
                 featureIndex.bucketLayerIDs.push(family.map((l) => l.id));
             }
         }

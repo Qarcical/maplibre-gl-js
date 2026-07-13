@@ -24,6 +24,13 @@ export type Segment = {
  */
 export class SegmentVector {
     static MAX_VERTEX_ARRAY_LENGTH: number;
+    /**
+     * PATCH (map2-fork): who is being bucketed right now (`source/layer@zN`), set by
+     * the worker's populate loop, so the max-vertices overflow warning names its
+     * culprit. An overflowing segment renders CORRUPTED with 16-bit indices, so
+     * knowing the layer matters (first seen: 66540 vertices on a climbs layer).
+     */
+    static bucketContext: string | null = null;
     segments: Segment[];
     private _forceNewSegmentOnNextPrepare: boolean = false;
 
@@ -44,7 +51,7 @@ export class SegmentVector {
         const lastSegment: Segment = this.segments[this.segments.length - 1];
 
         if (numVertices > SegmentVector.MAX_VERTEX_ARRAY_LENGTH) {
-            warnOnce(`Max vertices per segment is ${SegmentVector.MAX_VERTEX_ARRAY_LENGTH}: bucket requested ${numVertices}. Consider using the \`fillLargeMeshArrays\` function if you require meshes with more than ${SegmentVector.MAX_VERTEX_ARRAY_LENGTH} vertices.`);
+            warnOnce(`Max vertices per segment is ${SegmentVector.MAX_VERTEX_ARRAY_LENGTH}: bucket requested ${numVertices}${SegmentVector.bucketContext ? ` [${SegmentVector.bucketContext}]` : ''}. Consider using the \`fillLargeMeshArrays\` function if you require meshes with more than ${SegmentVector.MAX_VERTEX_ARRAY_LENGTH} vertices.`);
         }
 
         if (this._forceNewSegmentOnNextPrepare || !lastSegment || lastSegment.vertexLength + numVertices > SegmentVector.MAX_VERTEX_ARRAY_LENGTH || lastSegment.sortKey !== sortKey) {

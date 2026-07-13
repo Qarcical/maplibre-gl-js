@@ -1,7 +1,7 @@
 import type {Context} from './context';
 import type {RGBAImage, AlphaImage} from '../util/image';
 import {premultiplyAlpha} from '../util/image';
-import {glStats} from './gl_stats';
+import {glStats, glMem} from './gl_stats';
 
 // PATCH (map2-fork): R32F added for single-channel float DEM textures (heights in metres).
 export type TextureFormat = WebGLRenderingContextBase['RGBA'] | WebGLRenderingContextBase['ALPHA'] | WebGL2RenderingContext['R32F'];
@@ -44,20 +44,29 @@ export class Texture {
     /** Tracks the original handle to detect corruption after context loss (#2811) */
     private _ownedHandle: WebGLTexture;
 
+    // PATCH (map2-fork): resident-memory accounting (see glMem in gl_stats.ts)
+    private _memBytes: number = 0;
+    private _memIsPool: boolean = false;
+    private _memIsDem: boolean = false;
+
     constructor(context: Context, image: TextureImage, format: TextureFormat, options?: {
         premultiply?: boolean;
         useMipmap?: boolean;
+        /** map2 fork: tags this texture as an RTT pool render target in the glMem gauge */
+        poolTexture?: boolean;
     } | null) {
         this.context = context;
         this.format = format;
         this.texture = context.gl.createTexture();
         this._ownedHandle = this.texture;
+        this._memIsPool = Boolean(options?.poolTexture);
         this.update(image, options);
     }
 
     update(image: TextureImage, options?: {
         premultiply?: boolean;
         useMipmap?: boolean;
+        poolTexture?: boolean;
     } | null, position?: {
         x: number;
         y: number;
@@ -84,6 +93,16 @@ export class Texture {
 
         if (resize) {
             this.size = [width, height];
+            // PATCH (map2-fork): resident accounting — storage is (re)allocated on this
+            // path only. ALPHA is 1 byte/px; RGBA and R32F are both 4.
+            const bpp = this.format === gl.ALPHA ? 1 : 4;
+            const newBytes = width * height * bpp;
+            if (this._memBytes === 0 && newBytes > 0) glMem.texCount++;
+            this._memIsDem = this.format === (gl as WebGL2RenderingContext).R32F;
+            glMem.texBytes += newBytes - this._memBytes;
+            if (this._memIsDem) glMem.demBytes += newBytes - this._memBytes;
+            if (this._memIsPool) glMem.poolBytes += newBytes - this._memBytes;
+            this._memBytes = newBytes;
             if (hasDataProperty(image)) {
                 // #2030: raw data is premultiplied in JS
                 context.pixelStoreUnpackPremultiplyAlpha.set(false);
@@ -181,5 +200,13 @@ export class Texture {
         gl.deleteTexture(this.texture);
         this.texture = null;
         this._ownedHandle = null;
+        // PATCH (map2-fork): resident accounting
+        if (this._memBytes > 0) {
+            glMem.texCount--;
+            glMem.texBytes -= this._memBytes;
+            if (this._memIsDem) glMem.demBytes -= this._memBytes;
+            if (this._memIsPool) glMem.poolBytes -= this._memBytes;
+            this._memBytes = 0;
+        }
     }
 }

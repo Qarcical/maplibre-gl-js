@@ -27,7 +27,14 @@ export type PoolObjectStash = {
 };
 
 export class RenderPool {
-    private _objects: PoolObject[];
+    /**
+     * Slot array indexed by object id. A `null` slot is an object released by
+     * {@link shrink} — ids must stay stable (cached render-to-texture entries address
+     * objects by id), so released slots are tombstoned and reused by the next grow.
+     */
+    private _objects: Array<PoolObject | null>;
+    /** live (non-tombstoned) object count — the pool's actual resident population */
+    private _liveCount: number;
     /**
      * An index array of recently used pool objects.
      * Items that are used recently are last in the array
@@ -49,6 +56,7 @@ export class RenderPool {
         private readonly _tileSize: number,
         private readonly _stash?: PoolObjectStash) {
         this._objects = [];
+        this._liveCount = 0;
         this._recentlyUsed = [];
         this._stamp = 0;
     }
@@ -64,6 +72,7 @@ export class RenderPool {
 
     public destruct() {
         for (const obj of this._objects) {
+            if (!obj) continue;
             // map2 fork: keep the GPU resources for the next terrain install — every
             // 2D↔3D round trip otherwise re-pays the whole allocation burst
             if (this._stash?.stashPoolObject?.(this._tileSize, obj.fbo, obj.texture)) continue;
@@ -100,7 +109,7 @@ export class RenderPool {
             ({fbo, texture} = stashed);
         } else {
             fbo = this._context.createFramebuffer(this._tileSize, this._tileSize, true, true);
-            texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA);
+            texture = new Texture(this._context, {width: this._tileSize, height: this._tileSize, data: null}, this._context.gl.RGBA, {poolTexture: true});
             texture.bind(this._context.gl.LINEAR, this._context.gl.CLAMP_TO_EDGE);
             if (this._context.extTextureFilterAnisotropic) {
                 this._context.gl.texParameterf(this._context.gl.TEXTURE_2D, this._context.extTextureFilterAnisotropic.TEXTURE_MAX_ANISOTROPY_EXT, this._context.extTextureFilterAnisotropicMax);
@@ -120,8 +129,9 @@ export class RenderPool {
         return {id, fbo, texture, stamp: -1, inUse: false, lastUsedFrame: -1};
     }
 
-    public getObjectForId(id: number): PoolObject {
-        return this._objects[id];
+    /** may return null for an id whose object was released by {@link shrink} */
+    public getObjectForId(id: number): PoolObject | null {
+        return this._objects[id] ?? null;
     }
 
     public useObject(obj: PoolObject) {
@@ -138,9 +148,14 @@ export class RenderPool {
     public getOrCreateFreeObject(): PoolObject {
         // Grow before reusing: every free object may back a render-to-texture cache
         // entry, and re-stamping one silently evicts that entry.
-        if (this._objects.length < this._size) {
-            const obj = this._createObject(this._objects.length);
-            this._objects.push(obj);
+        if (this._liveCount < this._size) {
+            // reuse a shrink-released slot's id first: a stale cache entry pointing at
+            // it can't false-hit (stamps are globally monotonic, never reused)
+            let slot = this._objects.indexOf(null);
+            if (slot < 0) slot = this._objects.length;
+            const obj = this._createObject(slot);
+            this._objects[slot] = obj;
+            this._liveCount++;
             return obj;
         }
         // At capacity, first look for a free object idle since an earlier frame, in
@@ -174,14 +189,51 @@ export class RenderPool {
     }
 
     public freeAllObjects() {
-        for (const obj of this._objects)
-            this.freeObject(obj);
+        for (const obj of this._objects) {
+            if (obj) this.freeObject(obj);
+        }
     }
 
     public isFull(): boolean {
-        if (this._objects.length < this._size) {
+        if (this._liveCount < this._size) {
             return false;
         }
-        return this._objects.some(o => !o.inUse) === false;
+        return this._objects.some(o => o && !o.inUse) === false;
+    }
+
+    /**
+     * map2 fork: release free pool objects the working set has left behind. The pool
+     * grows to peak-ever demand and stays there (grow-only kept the id addressing
+     * trivial) — measured on iPhone as a 688MB grow-only plateau riding ~100–300MB
+     * under the iOS tab-kill line while live demand oscillated at 20–55 objects.
+     * Called once per frame with the frame's demand: free objects idle for at least
+     * `minIdleFrames` (outside the working set by definition, so the cache entries
+     * they back are already dead weight) are handed to the painter's stash (byte-
+     * capped; overflow is destroyed), least-recently-used first, until the live count
+     * is down to `target`. Rate-limited so a demand drop never spends a visible slice
+     * of one frame on releases. A cache entry backed by a released object misses like
+     * any stamp mismatch on its next use — which the idle threshold makes rare.
+     * @returns how many objects were released
+     */
+    public shrink(target: number, minIdleFrames: number, maxReleases: number): number {
+        let released = 0;
+        while (this._liveCount > target && released < maxReleases) {
+            let victim: PoolObject = null;
+            for (const obj of this._objects) {
+                if (!obj || obj.inUse) continue;
+                if (this._frame - obj.lastUsedFrame < minIdleFrames) continue;
+                if (!victim || obj.lastUsedFrame < victim.lastUsedFrame) victim = obj;
+            }
+            if (!victim) break;
+            this._recentlyUsed = this._recentlyUsed.filter(id => id !== victim.id);
+            this._objects[victim.id] = null;
+            this._liveCount--;
+            if (!this._stash?.stashPoolObject?.(this._tileSize, victim.fbo, victim.texture)) {
+                victim.texture.destroy();
+                victim.fbo.destroy();
+            }
+            released++;
+        }
+        return released;
     }
 }

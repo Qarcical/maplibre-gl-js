@@ -63,6 +63,11 @@ export type GlStatsFrame = {
     poolAllocs: number;
     /** ms spent creating them — the first terrain frame allocates the whole working set */
     poolAllocMs: number;
+    /**
+     * RTT pool objects released by shrink-to-demand this frame (stashed or destroyed) —
+     * the demand-following counterpart of poolAllocs; the mem gauge shows the bytes
+     */
+    poolFrees: number;
     /** ms spent uploading DEM textures this frame (R32F, main-thread texImage2D) */
     demUploadMs: number;
     /** shader programs compiled+linked this frame (Painter.useProgram cache misses) */
@@ -107,6 +112,7 @@ function zeroFrame(): GlStatsFrame {
         bufferUploadBytes: 0,
         poolAllocs: 0,
         poolAllocMs: 0,
+        poolFrees: 0,
         demUploadMs: 0,
         programCompiles: 0,
         programCompileMs: 0,
@@ -116,6 +122,38 @@ function zeroFrame(): GlStatsFrame {
         tileUploadBudgetMs: 0,
     };
 }
+
+/**
+ * Resident GPU memory gauge — bytes currently ALLOCATED, not per-frame traffic.
+ * Tracked unconditionally (alloc/free are rare next to draw calls, and enabling
+ * glstats mid-session must still read correct residents). Covers every Texture
+ * object (tile rasters, atlases, DEM, RTT pool render targets) and vertex/index
+ * buffer. Not covered: renderbuffers (one shared depth-stencil per pool tier +
+ * the terrain facilitator fbos — bounded, ~tens of MB), canvas backbuffers, and
+ * browser-internal copies. Built for the iPhone crash hunt: iOS Safari jetsam-kills
+ * a tab around ~1–1.5GB with no error, so the question is which category grows.
+ */
+export type GlMemGauge = {
+    /** resident bytes across all live Texture objects */
+    texBytes: number;
+    texCount: number;
+    /** subset of texBytes: R32F DEM textures */
+    demBytes: number;
+    /** subset of texBytes: RTT pool render targets (live pools + painter stash) */
+    poolBytes: number;
+    /** resident bytes across live vertex + index buffers (tile geometry) */
+    bufferBytes: number;
+    bufferCount: number;
+};
+
+export const glMem: GlMemGauge = {
+    texBytes: 0,
+    texCount: 0,
+    demBytes: 0,
+    poolBytes: 0,
+    bufferBytes: 0,
+    bufferCount: 0,
+};
 
 class GlStats {
     /** counting is skipped entirely when disabled — the call sites are render-loop hot */
