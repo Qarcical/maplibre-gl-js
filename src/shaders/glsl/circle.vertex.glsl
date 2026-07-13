@@ -5,6 +5,12 @@ uniform highp float u_globe_extrude_scale;
 uniform lowp float u_device_pixel_ratio;
 uniform highp float u_camera_to_center_distance;
 uniform vec2 u_translate;
+// map2 fork: uniform anchor override (Map#setCircleAnchorOverride) — xy is the
+// anchor in this tile's units (may lie far outside 0..EXTENT; circles draw with
+// stencil disabled), z is the terrain elevation AT the override (already
+// exaggeration-scaled, matching get_elevation — the bound per-tile DEM texture
+// can't be sampled outside the tile), w > 0.5 enables it.
+uniform highp vec4 u_anchor_override;
 
 in vec2 a_pos;
 
@@ -34,8 +40,8 @@ void main(void) {
 
     // Divide a_pos by 8, since we had it * 8 in order to sneak
     // in extrusion data
-    vec2 circle_center = floor(pos_raw / 8.0) + u_translate;
-    float ele = get_elevation(circle_center);
+    vec2 circle_center = (u_anchor_override.w > 0.5 ? u_anchor_override.xy : floor(pos_raw / 8.0)) + u_translate;
+    float ele = u_anchor_override.w > 0.5 ? u_anchor_override.z : get_elevation(circle_center);
     v_visibility = calculate_visibility(projectTileWithElevation(circle_center, ele));
 
     if (u_pitch_with_map) {

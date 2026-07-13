@@ -1,4 +1,4 @@
-import {Uniform1i, Uniform1f, Uniform2f} from '../uniform_binding';
+import {Uniform1i, Uniform1f, Uniform2f, Uniform4f} from '../uniform_binding';
 import {pixelsToTileUnits} from '../../source/pixels_to_tile_units';
 
 import type {Context} from '../../webgl/context';
@@ -16,6 +16,8 @@ export type CircleUniformsType = {
     'u_device_pixel_ratio': Uniform1f;
     'u_globe_extrude_scale': Uniform1f;
     'u_translate': Uniform2f;
+    /** map2 fork: xy anchor in tile units, z elevation, w enable — see Map#setCircleAnchorOverride */
+    'u_anchor_override': Uniform4f;
 };
 
 const circleUniforms = (context: Context, locations: UniformLocations): CircleUniformsType => ({
@@ -26,6 +28,7 @@ const circleUniforms = (context: Context, locations: UniformLocations): CircleUn
     'u_device_pixel_ratio': new Uniform1f(context, locations.u_device_pixel_ratio),
     'u_globe_extrude_scale': new Uniform1f(context, locations.u_globe_extrude_scale),
     'u_translate': new Uniform2f(context, locations.u_translate),
+    'u_anchor_override': new Uniform4f(context, locations.u_anchor_override),
 });
 
 const circleUniformValues = (
@@ -33,7 +36,8 @@ const circleUniformValues = (
     tile: Tile,
     layer: CircleStyleLayer,
     translate: [number, number],
-    radiusCorrectionFactor: number
+    radiusCorrectionFactor: number,
+    anchorOverride: [number, number, number, number] = [0, 0, 0, 0]
 ): UniformValues<CircleUniformsType> => {
     const transform = painter.transform;
 
@@ -60,6 +64,7 @@ const circleUniformValues = (
         'u_extrude_scale': extrudeScale,
         'u_globe_extrude_scale': globeExtrudeScale,
         'u_translate': translate,
+        'u_anchor_override': anchorOverride,
     };
 };
 

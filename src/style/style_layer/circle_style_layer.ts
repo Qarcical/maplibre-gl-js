@@ -18,6 +18,15 @@ export class CircleStyleLayer extends StyleLayer {
     _unevaluatedLayout: Layout<CircleLayoutProps>;
     layout: PossiblyEvaluated<CircleLayoutProps, CircleLayoutPropsPossiblyEvaluated>;
 
+    /**
+     * map2 fork: when set, every circle of this layer draws at this position instead
+     * of its baked geometry — one uniform per frame, no worker round trip (see
+     * Map#setCircleAnchorOverride; built for the challenge animation's playhead,
+     * whose per-frame setData froze for whole worker-latency stretches on phones).
+     * Contract: the layer's source should hold exactly ONE feature while overridden.
+     */
+    anchorOverride: {lng: number; lat: number} | null = null;
+
     _transitionablePaint: Transitionable<CirclePaintProps>;
     _transitioningPaint: Transitioning<CirclePaintProps>;
     paint: PossiblyEvaluated<CirclePaintProps, CirclePaintPropsPossiblyEvaluated>;

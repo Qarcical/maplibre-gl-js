@@ -18,6 +18,8 @@ import type {CircleUniformsType} from '../program/circle_program';
 import type {TerrainData} from '../../render/terrain';
 import {translatePosition} from '../../util/util';
 import type {ProjectionData} from '../../geo/projection/projection_data';
+import {MercatorCoordinate} from '../../geo/mercator_coordinate';
+import {LngLat} from '../../geo/lng_lat';
 
 type TileRenderState = {
     programConfiguration: ProgramConfiguration;
@@ -63,6 +65,21 @@ export function drawCircles(painter: Painter, tileManager: TileManager, layer: C
     // Note: due to how the shader is written, this value only has effect when globe rendering is enabled and `circle-pitch-alignment` is set to 'map'.
     const radiusCorrectionFactor = transform.getCircleRadiusCorrection();
 
+    // map2 fork: uniform anchor override (Map#setCircleAnchorOverride) — reposition
+    // the layer's (single) circle per frame without a worker round trip. Elevation
+    // comes along as a uniform: the anchor may lie far outside the drawn tile, where
+    // the bound per-tile DEM texture can't be sampled. getElevationForLngLatZoom is
+    // exaggeration-scaled, matching the shader's get_elevation, so the circle sits
+    // exactly on draped/live geometry through the exaggeration ramp.
+    const anchorOverride = layer.anchorOverride;
+    let overrideMercator: MercatorCoordinate = null;
+    let overrideElevation = 0;
+    if (anchorOverride) {
+        const lngLat = new LngLat(anchorOverride.lng, anchorOverride.lat);
+        overrideMercator = MercatorCoordinate.fromLngLat(lngLat);
+        overrideElevation = painter.style.map.terrain?.getElevationForLngLatZoom(lngLat, transform.tileZoom) ?? 0;
+    }
+
     for (const coord of coords) {
 
         const tile = tileManager.getTile(coord);
@@ -73,12 +90,21 @@ export function drawCircles(painter: Painter, tileManager: TileManager, layer: C
         const styleTranslateAnchor = layer.paint.get('circle-translate-anchor');
         const translateForUniforms = translatePosition(transform, tile, styleTranslate, styleTranslateAnchor);
 
+        // the override anchor is absolute, so it must draw from exactly ONE tile —
+        // parent/child retention or geojson buffer copies would otherwise stack the
+        // same translucent circle on itself (circles already draw stencil-free)
+        let anchorUniform: [number, number, number, number] = [0, 0, 0, 0];
+        if (anchorOverride) {
+            const tilePoint = coord.getTilePoint(overrideMercator);
+            anchorUniform = [tilePoint.x, tilePoint.y, overrideElevation, 1];
+        }
+
         const programConfiguration = bucket.programConfigurations.get(layer.id);
         const program = painter.useProgram('circle', programConfiguration);
         const layoutVertexBuffer = bucket.layoutVertexBuffer;
         const indexBuffer = bucket.indexBuffer;
         const terrainData = painter.style.map.terrain?.getTerrainData(coord);
-        const uniformValues = circleUniformValues(painter, tile, layer, translateForUniforms, radiusCorrectionFactor);
+        const uniformValues = circleUniformValues(painter, tile, layer, translateForUniforms, radiusCorrectionFactor, anchorUniform);
 
         const projectionData = transform.getProjectionData({overscaledTileID: coord, applyGlobeMatrix: !isRenderingToTexture, applyTerrainMatrix: true});
 
@@ -109,6 +135,8 @@ export function drawCircles(painter: Painter, tileManager: TileManager, layer: C
             });
         }
 
+        // overridden: first tile with a bucket wins, the rest would double-draw
+        if (anchorOverride) break;
     }
 
     if (sortFeaturesByKey) {

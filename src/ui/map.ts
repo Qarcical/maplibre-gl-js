@@ -4384,6 +4384,32 @@ export class Map extends Camera {
     }
 
     /**
+     * map2 fork: draw a circle layer's circle at `lngLat` instead of its baked
+     * geometry — one uniform per frame, no worker round trip. Built for the
+     * challenge animation's playhead: its per-frame GeoJSON setData costs two
+     * worker round trips per visible move through an actor shared with tile
+     * decoding, and GeoJSONSource coalesces updates in flight, so the head froze
+     * for whole decode stretches on phones while the (uniform-clipped) line kept
+     * growing. With the override, the layer's source keeps ONE static feature
+     * (so a bucket exists to draw) and the anchor rides a uniform in lockstep
+     * with setLineProgressClip. Contract: single-feature source while overridden
+     * (every circle in the bucket draws at the anchor); hit-testing still sees
+     * the static geometry; the static feature must stay within tile retention —
+     * re-setData it near the anchor occasionally (the app rebases every ~1.5km).
+     * Pass null to disable. No-op for non-circle layers.
+     */
+    setCircleAnchorOverride(layerId: string, lngLat: LngLatLike | null): this {
+        const layer = this.style?.getLayer(layerId) as {anchorOverride?: {lng: number; lat: number} | null};
+        if (!layer || !('anchorOverride' in layer)) return this;
+        const value = lngLat ? LngLat.convert(lngLat) : null;
+        const previous = layer.anchorOverride;
+        if (previous === value || (previous && value && previous.lng === value.lng && previous.lat === value.lat)) return this;
+        layer.anchorOverride = value ? {lng: value.lng, lat: value.lat} : null;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
      * map2 fork: clip all `fill-extrusion` layers to a lng/lat window, discarding
      * extruded fragments outside it in the fragment shader. Used by the challenge
      * exports so extruded buildings don't poke through the draped plate mask in 3D
