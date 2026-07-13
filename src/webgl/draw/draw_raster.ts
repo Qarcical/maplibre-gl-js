@@ -108,6 +108,11 @@ function drawTiles(
             rasterOpacity === 1 ? DepthMode.ReadWrite : DepthMode.ReadOnly, gl.LESS);
 
         const tile = tileManager.getTile(coord);
+        if (!tile.texture) {
+            // PATCH (map2-fork): empty tile from a sparse archive — loaded (complete) but
+            // nothing to draw
+            continue;
+        }
 
         // create and bind first texture
         context.activeTexture.set(gl.TEXTURE0);
@@ -160,7 +165,8 @@ function getFadeProperties(tile: Tile, tileManager: TileManager, fadeDuration: n
     // cross-fade with parent first if available
     if (tile.fadingParentID) {
         const parentTile = tileManager.getLoadedTile(tile.fadingParentID);
-        if (!parentTile) return defaults;
+        // no parent (or an empty sparse-archive tile with no texture to fade from) — no cross-fade
+        if (!parentTile?.texture) return defaults;
 
         const parentScaleBy = Math.pow(2, parentTile.tileID.overscaledZ - tile.tileID.overscaledZ);
         const parentTopLeft: [number, number] = [

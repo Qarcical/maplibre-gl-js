@@ -170,6 +170,12 @@ export namespace ImageRequest {
             } else if (response.data) {
                 const img = await arrayBufferToCanvasImageSource(response.data);
                 onSuccess({data: img, cacheControl: response.cacheControl, expires: response.expires});
+            } else {
+                // PATCH (map2-fork): a custom protocol (pmtiles) resolves {data: null} for a
+                // tile absent from a sparse archive. Settle the promise with null data —
+                // falling through here left it pending forever, parking the tile in
+                // 'loading' and making 'idle'/'load' unreachable.
+                onSuccess({data: null, cacheControl: response.cacheControl, expires: response.expires});
             }
         } catch (err) {
             delete itemInQueue.abortController;

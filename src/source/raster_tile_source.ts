@@ -204,6 +204,11 @@ export class RasterTileSource extends Evented implements Source {
                     tile.texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE, gl.LINEAR_MIPMAP_NEAREST);
                 }
                 tile.state = 'loaded';
+            } else {
+                // PATCH (map2-fork): null data = tile absent from a sparse archive (pmtiles
+                // resolves null rather than 404ing). An empty tile draws nothing but counts
+                // as complete — leaving it in 'loading' hangs 'idle'/'load' forever.
+                tile.state = 'loaded';
             }
         } catch (err) {
             delete tile.abortController;

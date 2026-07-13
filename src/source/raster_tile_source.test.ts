@@ -7,6 +7,7 @@ import {fakeServer, type FakeServer} from 'nise';
 import {type Tile} from '../tile/tile';
 import {sleep, stubAjaxGetImage, waitForEvent} from '../util/test/util';
 import {type MapSourceDataEvent} from '../ui/events';
+import {addProtocol, removeProtocol} from './protocol_crud';
 
 function createSource(options, transformCallback?) {
     const source = new RasterTileSource('id', options, {send() {}} as any as Dispatcher, options.eventedParent);
@@ -374,6 +375,34 @@ describe('RasterTileSource', () => {
         await tilePromise;
         expect(tile.state).toBe('loaded');
         expect(expiryDataSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('absent tile (protocol resolves null data) becomes an empty loaded tile', async () => {
+        // PATCH (map2-fork): pmtiles resolves {data: null} for a tile absent from a sparse
+        // archive. The tile must reach 'loaded' (with no texture; draw_raster skips it) or
+        // areTilesLoaded()/'idle' hang forever.
+        addProtocol('sparse', async () => ({data: null}));
+        try {
+            const source = createSource({
+                minzoom: 0,
+                maxzoom: 22,
+                tiles: ['sparse://archive/{z}/{x}/{y}.png']
+            });
+            await waitForEvent(source, 'data', (e: MapSourceDataEvent) => e.sourceDataType === 'metadata');
+
+            const tile = {
+                tileID: new OverscaledTileID(9, 0, 9, 253, 166),
+                state: 'loading',
+                loadVectorData() {},
+                setExpiryData() {}
+            } as any as Tile;
+            await source.loadTile(tile);
+
+            expect(tile.state).toBe('loaded');
+            expect(tile.texture).toBeUndefined();
+        } finally {
+            removeProtocol('sparse');
+        }
     });
 
     test('does not throw when tile is aborted', async () => {

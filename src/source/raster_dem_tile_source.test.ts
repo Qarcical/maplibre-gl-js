@@ -6,6 +6,7 @@ import {RequestManager} from '../util/request_manager';
 import {type Tile} from '../tile/tile';
 import {getMockDispatcher} from '../util/test/util';
 import {sleep, waitForEvent, waitForMetadataEvent} from '../util/test/util';
+import {addProtocol, removeProtocol} from './protocol_crud';
 import type {MapSourceDataEvent} from '../ui/events';
 
 function createSource(options, transformCallback?) {
@@ -340,6 +341,30 @@ describe('RasterDEMTileSource', () => {
 
         await expect(loadPromise).resolves.toBeUndefined();
         expect(tile.state).toBe('unloaded');
+    });
+
+    test('absent tile (protocol resolves null data) becomes an empty loaded tile', async () => {
+        // PATCH (map2-fork): sparse archives (sea-only DEM) legitimately have no tile for
+        // some coordinates; pmtiles resolves {data: null}. The tile must reach 'loaded'
+        // (with no dem) or areTilesLoaded()/'idle' hang forever.
+        addProtocol('sparse', async () => ({data: null}));
+        try {
+            const source = createSource({tiles: ['sparse://archive/{z}/{x}/{y}.png']});
+            await waitForMetadataEvent(source);
+
+            const tile = {
+                tileID: new OverscaledTileID(9, 0, 9, 253, 166),
+                state: 'loading',
+                loadVectorData() {},
+                setExpiryData() {}
+            } as any as Tile;
+            await source.loadTile(tile);
+
+            expect(tile.state).toBe('loaded');
+            expect(tile.dem).toBeUndefined();
+        } finally {
+            removeProtocol('sparse');
+        }
     });
 
     test('reloads tile in reloading state', async () => {

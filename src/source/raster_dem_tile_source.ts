@@ -95,6 +95,12 @@ export class RasterDEMTileSource extends RasterTileSource implements Source {
                 tile.needsHillshadePrepare = true;
                 tile.needsTerrainPrepare = true;
                 tile.state = 'loaded';
+            } else {
+                // PATCH (map2-fork): null data = tile absent from a sparse archive (a sea-only
+                // DEM has no inland tiles; pmtiles resolves null rather than 404ing). Loaded
+                // with no dem: hillshade/color-relief/terrain all skip dem-less tiles, so it
+                // renders as nothing — but counts as complete, keeping 'idle'/'load' reachable.
+                tile.state = 'loaded';
             }
         } catch (err) {
             delete tile.abortController;

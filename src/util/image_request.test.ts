@@ -5,6 +5,7 @@ import {fakeServer, type FakeServer} from 'nise';
 import {ImageRequest} from './image_request';
 import {isAbortError} from './abort_error';
 import * as ajax from './ajax';
+import {addProtocol, removeProtocol} from '../source/protocol_crud';
 
 describe('ImageRequest', () => {
     let server: FakeServer;
@@ -16,6 +17,18 @@ describe('ImageRequest', () => {
     });
     afterEach(() => {
         server.restore();
+    });
+
+    test('getImage resolves with null data when a custom protocol returns no data (absent sparse-archive tile)', async () => {
+        // PATCH (map2-fork): pmtiles resolves {data: null} for a tile absent from a sparse
+        // archive; the promise must settle (previously it stayed pending forever).
+        addProtocol('sparse', async () => ({data: null}));
+        try {
+            const response = await ImageRequest.getImage({url: 'sparse://archive/9/253/166'}, new AbortController());
+            expect(response.data).toBeNull();
+        } finally {
+            removeProtocol('sparse');
+        }
     });
 
     test('getImage respects maxParallelImageRequests', async () => {
