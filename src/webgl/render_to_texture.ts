@@ -207,8 +207,34 @@ export class RenderToTexture {
         this._pendingSourceTileChanges.push({sourceId, soft: true});
     }
 
+    // PATCH (map2-fork): camera zoom at which hillshade drapes were last refreshed for
+    // the zoom adjust (see below). Undefined until the first prepareForRender.
+    _hillshadeAdjustZoom: number;
+
     prepareForRender(style: Style, zoom: number) {
         for (const pool of this.pools) pool.beginFrame();
+
+        // PATCH (map2-fork): the hillshade render pass scales slope intensity to the
+        // continuous MAP zoom (u_zoom_adjust, hillshade_program.ts), but a cached drape
+        // texture holds the intensity it was rendered at — a zoom drift (e.g. the flyTo
+        // between tracks) would otherwise leave a patchwork of tiles stamped at
+        // different zooms. Refresh hillshade-draping stacks through the soft budget
+        // once the camera has moved half a zoom level since the last refresh; each
+        // tile's step is then ≤ ~11% and spread across frames.
+        if (this.painter.style.map._hillshadeZoomAdjust !== false) {
+            if (this._hillshadeAdjustZoom === undefined) this._hillshadeAdjustZoom = zoom;
+            if (Math.abs(zoom - this._hillshadeAdjustZoom) > 0.5) {
+                this._hillshadeAdjustZoom = zoom;
+                const seen = new Set<string>();
+                for (const id of style._order) {
+                    const layer = style._layers[id];
+                    if (layer.type === 'hillshade' && layer.source && !seen.has(layer.source)) {
+                        seen.add(layer.source);
+                        this.markSourceChangedSoft(layer.source);
+                    }
+                }
+            }
+        }
         this._stacks = [];
         this._prevType = null;
         this._rttTiles = [];

@@ -3,6 +3,12 @@ in vec2 v_pos;
 
 uniform vec2 u_latrange;
 uniform float u_exaggeration;
+// PATCH (map2-fork): rescales the prepared derivative from the intensity the prepare
+// pass baked at the TILE's integer zoom to the intensity for the current MAP zoom
+// (see hillshade_program.ts). Without it, every DEM LOD swap steps shading intensity
+// by ~2^0.3 per zoom level (the prepare pass's zoom-dependent exaggeration term),
+// which reads as per-tile brightness pops during 3D camera animations.
+uniform float u_zoom_adjust;
 uniform vec4 u_accent;
 uniform int u_method;
 uniform float u_altitudes[NUM_ILLUMINATION_SOURCES];
@@ -157,7 +163,7 @@ void main() {
     // to account for mercator projection distortion. see #4807 for details
     float scaleFactor = cos(radians((u_latrange[0] - u_latrange[1]) * (1.0 - v_pos.y) + u_latrange[1]));
 
-    vec2 deriv = ((pixel.rg * 8.0) - 4.0) / scaleFactor;
+    vec2 deriv = ((pixel.rg * 8.0) - 4.0) * u_zoom_adjust / scaleFactor;
 
     if (u_method == BASIC) {
         basic_hillshade(deriv);

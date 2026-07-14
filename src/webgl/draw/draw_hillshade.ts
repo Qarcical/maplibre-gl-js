@@ -63,6 +63,7 @@ function renderHillshade(
     const defines = [`#define NUM_ILLUMINATION_SOURCES ${layer.paint.get('hillshade-highlight-color').values.length}`];
     const program = painter.useProgram('hillshade', null, false, defines);
     const align = !painter.options.moving;
+    const sourceMaxZoom = tileManager.getSource().maxzoom;
 
     for (const coord of coords) {
         const tile = tileManager.getTile(coord);
@@ -85,7 +86,7 @@ function renderHillshade(
         });
 
         program.draw(context, gl.TRIANGLES, depthMode, stencilModes[coord.overscaledZ], colorMode, CullFaceMode.backCCW,
-            hillshadeUniformValues(painter, tile, layer), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
+            hillshadeUniformValues(painter, tile, layer, sourceMaxZoom), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
     }
 }
 

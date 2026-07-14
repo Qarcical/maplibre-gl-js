@@ -4200,6 +4200,37 @@ export class Map extends Camera {
     }
 
     /**
+     * map2 fork: hillshade intensity follows the continuous MAP zoom instead of each
+     * DEM tile's integer zoom (on by default). Stock bakes a zoom-dependent
+     * exaggeration term into the prepare pass at the tile's overscaledZ, so every DEM
+     * LOD swap steps that tile's shading intensity by ~23% — per-tile brightness pops
+     * during 3D camera animations. See getHillshadeZoomAdjust in hillshade_program.ts.
+     */
+    _hillshadeZoomAdjust: boolean = true;
+
+    /**
+     * map2 fork: disable/enable the hillshade zoom adjust (the `?nohsadj` A/B in the
+     * challenge app). Hard-invalidates draped hillshade sources so cached drape
+     * textures pick up the flip.
+     */
+    setHillshadeZoomAdjust(on: boolean): this {
+        this._hillshadeZoomAdjust = !!on;
+        const renderToTexture = this.painter?.renderToTexture;
+        if (renderToTexture && this.style) {
+            const seen = new Set<string>();
+            for (const id of this.style._order) {
+                const layer = this.style._layers[id];
+                if (layer.type === 'hillshade' && layer.source && !seen.has(layer.source)) {
+                    seen.add(layer.source);
+                    renderToTexture.markSourceChanged(layer.source);
+                }
+            }
+        }
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
      * map2 fork: the mode worker tile parses are dispatched for — layers tagged
      * `map2:visible-when` for the other mode get no buckets built (see setDecodeMode).
      */
@@ -4304,6 +4335,31 @@ export class Map extends Camera {
             }
         };
         this._terrainWarmTimer = setTimeout(tick, 0);
+        return this;
+    }
+
+    /**
+     * map2 fork: synchronously drain the warm-up backlog (shader variants + RTT pool
+     * objects) in one burst, up to `maxMs`. The idle drain correctly yields while the
+     * camera moves, so a 3D entry started right after load races it — and losing the
+     * race pays the un-warmed remainder as in-frame stalls mid-flight (100–200ms
+     * singles on Adreno). Call this at a 3D entry point BEFORE the camera starts
+     * moving (and before setTerrain — pool warming no-ops once terrain is installed):
+     * one bounded pause behind static UI beats the same cost as jank. No-op when
+     * everything is already warm, which is the common case; anything past the cap
+     * stays queued for the idle drain.
+     */
+    drainTerrainWarm(maxMs: number = 500): this {
+        if (!this.painter || this.painter.context.gl.isContextLost()) return this;
+        const start = performance.now();
+        let drained = 0;
+        while (performance.now() - start < maxMs &&
+               (this.painter.warmTerrainProgram() || this.painter.warmPoolObject())) {
+            drained++;
+        }
+        if (drained > 0) {
+            console.log(`[map2-fork] burst-drained ${drained} terrain resource(s) (shaders + pool) in ${Math.round(performance.now() - start)}ms`);
+        }
         return this;
     }
 

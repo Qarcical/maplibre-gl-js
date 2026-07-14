@@ -25,6 +25,7 @@ export type HillshadeUniformsType = {
     'u_image': Uniform1i;
     'u_latrange': Uniform2f;
     'u_exaggeration': Uniform1f;
+    'u_zoom_adjust': Uniform1f;
     'u_altitudes': UniformFloatArray;
     'u_azimuths': UniformFloatArray;
     'u_accent': UniformColor;
@@ -44,6 +45,7 @@ const hillshadeUniforms = (context: Context, locations: UniformLocations): Hills
     'u_image': new Uniform1i(context, locations.u_image),
     'u_latrange': new Uniform2f(context, locations.u_latrange),
     'u_exaggeration': new Uniform1f(context, locations.u_exaggeration),
+    'u_zoom_adjust': new Uniform1f(context, locations.u_zoom_adjust),
     'u_altitudes': new UniformFloatArray(context, locations.u_altitudes),
     'u_azimuths': new UniformFloatArray(context, locations.u_azimuths),
     'u_accent': new UniformColor(context, locations.u_accent),
@@ -59,10 +61,36 @@ const hillshadePrepareUniforms = (context: Context, locations: UniformLocations)
     'u_zoom': new Uniform1f(context, locations.u_zoom)
 });
 
+// PATCH (map2-fork): the prepare pass scales the stored derivative by a zoom-dependent
+// exaggeration term — exaggeration = (z − 15) · 0.3 for z < 15 — evaluated at the TILE's
+// integer overscaledZ. That makes shading intensity step by 2^0.3 (~23%) whenever a DEM
+// tile is swapped for a different LOD, which the 3D follow-cam does per-tile
+// mid-animation (hard brightness pops; there is no fade anywhere in the hillshade path).
+// This factor re-bases the derivative onto the same exaggeration curve evaluated at the
+// CONTINUOUS covering zoom of the current transform, so all visible tiles share one
+// intensity at any instant and it varies smoothly with camera zoom. The covering zoom is
+// clamped to the source's maxzoom so the close-up look (every tile at maxzoom) matches
+// stock exactly. Disable via map.setHillshadeZoomAdjust(false) (`?nohsadj` in the
+// challenge app).
+function stockPrepareExaggeration(z: number): number {
+    if (z >= 15) return 0;
+    const factor = z < 2 ? 0.4 : z < 4.5 ? 0.35 : 0.3;
+    return (z - 15) * factor;
+}
+
+function getHillshadeZoomAdjust(painter: Painter, tile: Tile, sourceMaxZoom?: number): number {
+    if (painter.style.map._hillshadeZoomAdjust === false) return 1;
+    let coverZoom = painter.transform.zoom + Math.log2(painter.transform.tileSize / tile.tileSize);
+    if (sourceMaxZoom !== undefined && sourceMaxZoom !== null) coverZoom = Math.min(coverZoom, sourceMaxZoom);
+    coverZoom = Math.max(0, coverZoom);
+    return Math.pow(2, stockPrepareExaggeration(tile.tileID.overscaledZ) - stockPrepareExaggeration(coverZoom));
+}
+
 const hillshadeUniformValues = (
     painter: Painter,
     tile: Tile,
     layer: HillshadeStyleLayer,
+    sourceMaxZoom?: number,
 ): UniformValues<HillshadeUniformsType> => {
     const accent = layer.paint.get('hillshade-accent-color');
     let method;
@@ -97,6 +125,7 @@ const hillshadeUniformValues = (
         'u_image': 0,
         'u_latrange': getTileLatRange(painter, tile.tileID),
         'u_exaggeration': layer.paint.get('hillshade-exaggeration'),
+        'u_zoom_adjust': getHillshadeZoomAdjust(painter, tile, sourceMaxZoom),
         'u_altitudes': illumination.altitudeRadians,
         'u_azimuths': illumination.directionRadians,
         'u_accent': accent,
@@ -135,5 +164,6 @@ export {
     hillshadeUniforms,
     hillshadePrepareUniforms,
     hillshadeUniformValues,
-    hillshadeUniformPrepareValues
+    hillshadeUniformPrepareValues,
+    getHillshadeZoomAdjust
 };
