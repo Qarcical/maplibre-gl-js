@@ -4369,6 +4369,15 @@ export class Map extends Camera {
      * per-vertex line progress) and its GeoJSON source to set `lineMetrics: true`.
      * Progress is per feature — multi-feature data animates all features in parallel.
      */
+    /**
+     * map2 fork capability flag: line buckets honour the per-feature progress-span
+     * properties `map2:p0`/`map2:p1` (a feature's metric span within a shared
+     * parameterisation), letting one setLineProgressClip uniform grow a
+     * discontinuous multi-segment track sequentially. Apps gate multi-segment trim
+     * mode on this so older bundles fall back to the legacy slicer.
+     */
+    readonly supportsLineProgressSpans = true;
+
     setLineProgressClip(layerId: string, progress: number | null): this {
         const layer = this.style?.getLayer(layerId) as {lineProgressClip?: number | null; source?: string};
         if (!layer || !('lineProgressClip' in layer)) return this;
@@ -4395,7 +4404,10 @@ export class Map extends Camera {
      * with setLineProgressClip. Contract: single-feature source while overridden
      * (every circle in the bucket draws at the anchor); hit-testing still sees
      * the static geometry; the static feature must stay within tile retention —
-     * re-setData it near the anchor occasionally (the app rebases every ~1.5km).
+     * re-setData it near the anchor frequently enough that its tile stays in the
+     * VISIBLE set — drawing picks the first visible tile with a bucket, so an
+     * anchor culled by a moving camera has no bucket to draw and the circle
+     * vanishes (the app rebases every ~300m of tip travel for this reason).
      * Pass null to disable. No-op for non-circle layers.
      */
     setCircleAnchorOverride(layerId: string, lngLat: LngLatLike | null): this {

@@ -44,6 +44,11 @@ import type {VectorTileLayerLike} from '@maplibre/vt-pbf';
 // the acute/bevelled line join.
 const EXTRUDE_SCALE = 63;
 
+// map2 fork: optional per-feature progress-span properties (see lineFeatureClips) —
+// the feature's metric span within a parameterisation shared across features.
+export const MAP2_PROGRESS_SPAN_START = 'map2:p0';
+export const MAP2_PROGRESS_SPAN_END = 'map2:p1';
+
 /*
  * Sharp corners cause dashed lines to tilt because the distance along the line
  * is the same at both the inner and outer corners. To improve the appearance of
@@ -248,8 +253,21 @@ export class LineBucket implements Bucket {
 
     lineFeatureClips(feature: BucketFeature): LineClips | undefined {
         if (!!feature.properties && Object.hasOwn(feature.properties, GEOJSONVT_CLIP_START) && Object.hasOwn(feature.properties, GEOJSONVT_CLIP_END)) {
-            const start = +feature.properties[GEOJSONVT_CLIP_START];
-            const end = +feature.properties[GEOJSONVT_CLIP_END];
+            let start = +feature.properties[GEOJSONVT_CLIP_START];
+            let end = +feature.properties[GEOJSONVT_CLIP_END];
+            // map2 fork: an app-authored progress span remaps this feature's whole-feature
+            // progress into a parameterisation shared ACROSS features. Built for growing a
+            // discontinuous (multi-segment) track with one progress-clip uniform: each
+            // segment is uploaded as its own feature carrying its metric span [p0, p1] of
+            // the whole track, so a_global_progress becomes track-global and the segments
+            // grow sequentially. Affine remap of the geojson-vt clip range only — a_uv_x
+            // (progress within this feature's tile slice) is unchanged by construction.
+            if (Object.hasOwn(feature.properties, MAP2_PROGRESS_SPAN_START) && Object.hasOwn(feature.properties, MAP2_PROGRESS_SPAN_END)) {
+                const p0 = +feature.properties[MAP2_PROGRESS_SPAN_START];
+                const p1 = +feature.properties[MAP2_PROGRESS_SPAN_END];
+                start = p0 + start * (p1 - p0);
+                end = p0 + end * (p1 - p0);
+            }
             return {start, end};
         }
     }
