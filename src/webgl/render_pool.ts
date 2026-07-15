@@ -73,11 +73,32 @@ export class RenderPool {
     public destruct() {
         for (const obj of this._objects) {
             if (!obj) continue;
+            this._detachSharedDepthStencil(obj.fbo);
             // map2 fork: keep the GPU resources for the next terrain install — every
             // 2D↔3D round trip otherwise re-pays the whole allocation burst
             if (this._stash?.stashPoolObject?.(this._tileSize, obj.fbo, obj.texture)) continue;
             obj.texture.destroy();
             obj.fbo.destroy();
+        }
+        if (this._sharedDepthStencil) {
+            this._context.gl.deleteRenderbuffer(this._sharedDepthStencil);
+            this._sharedDepthStencil = null;
+        }
+    }
+
+    /**
+     * map2 fork: detach the SHARED depth-stencil renderbuffer from an fbo leaving the
+     * pool. Framebuffer.destroy deletes whatever renderbuffer is attached, so a
+     * stash-refused victim used to delete the renderbuffer every other live fbo in
+     * the pool still references — the next _createObject then attached a deleted
+     * object (field-caught 2026-07-15: INVALID_OPERATION mid-anim after shrink
+     * cycles with the stash at its byte cap). Stashed objects must shed it too:
+     * painter.trimPoolStash destroys stash entries with the same hazard, and
+     * adoption by a new pool re-attaches its own anyway.
+     */
+    private _detachSharedDepthStencil(fbo: Framebuffer) {
+        if (this._sharedDepthStencil && fbo.depthAttachment) {
+            fbo.depthAttachment.set(null);
         }
     }
 
@@ -228,6 +249,7 @@ export class RenderPool {
             this._recentlyUsed = this._recentlyUsed.filter(id => id !== victim.id);
             this._objects[victim.id] = null;
             this._liveCount--;
+            this._detachSharedDepthStencil(victim.fbo);
             if (!this._stash?.stashPoolObject?.(this._tileSize, victim.fbo, victim.texture)) {
                 victim.texture.destroy();
                 victim.fbo.destroy();

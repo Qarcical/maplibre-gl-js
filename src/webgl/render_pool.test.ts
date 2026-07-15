@@ -195,6 +195,28 @@ describe('render pool shrink', () => {
         expect(pool.shrink(1, 5, 8)).toBe(1);
         expect(destroySpy).toHaveBeenCalled();
     });
+
+    // PATCH (map2-fork): Framebuffer.destroy deletes whatever renderbuffer is attached,
+    // and pool fbos share ONE depth-stencil renderbuffer — a stash-refused shrink victim
+    // used to delete it out from under the still-live pool, so the next grow attached a
+    // deleted object (field-caught as INVALID_OPERATION mid-anim).
+    test('shrink never deletes the shared depth-stencil; destruct deletes it exactly once', () => {
+        const gl = document.createElement('canvas').getContext('webgl');
+        vi.spyOn(gl, 'checkFramebufferStatus').mockReturnValue(gl.FRAMEBUFFER_COMPLETE);
+        const deleteSpy = vi.spyOn(gl, 'deleteRenderbuffer');
+        const stash = {takePoolStash: () => null, stashPoolObject: () => false};
+        const pool = new RenderPool(new Context(gl), 3, 512, stash as any);
+        grow(pool, 3);
+        advanceFrames(pool, 10);
+        expect(pool.shrink(1, 5, 8)).toBe(2);
+        // the shared renderbuffer survives the destroyed victims...
+        expect(deleteSpy).not.toHaveBeenCalled();
+        // ...and a re-grow attaches it to a fresh fbo without touching a deleted object
+        pool.getOrCreateFreeObject();
+        // uninstall (stash still refusing → objects destroyed too) releases it exactly once
+        pool.destruct();
+        expect(deleteSpy).toHaveBeenCalledTimes(1);
+    });
 });
 
 // PATCH (map2-fork): the pool adopts pre-allocated framebuffer+texture pairs from a

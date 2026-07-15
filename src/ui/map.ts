@@ -4339,6 +4339,27 @@ export class Map extends Camera {
     }
 
     /**
+     * map2 fork: seed the terrain warm queue from the loaded style itself, then kick
+     * the idle drain. Recording 2D compiles ({@link Map#setTerrainProgramWarming})
+     * structurally can't see shader variants that only ever draw in 3D — photo
+     * symbols and anim overlays first draw mid-flight and compile in-frame (44–91ms
+     * singles on Adreno at anim entry). Seeding derives every layer's program
+     * name(s) + configuration from its evaluated style declarations instead, so the
+     * warm queue covers the style's whole variant surface. Call after the 'load'
+     * event (paint properties must be evaluated); safe to re-call, e.g. after
+     * runtime layer additions.
+     */
+    seedTerrainProgramsFromStyle(): this {
+        if (!this.painter || !this.style) return this;
+        const seeded = this.painter.seedTerrainWarmFromStyle();
+        if (seeded > 0) {
+            console.log(`[map2-fork] seeded ${seeded} terrain shader variant(s) from the style`);
+            this.precompileTerrainPrograms();
+        }
+        return this;
+    }
+
+    /**
      * map2 fork: synchronously drain the warm-up backlog (shader variants + RTT pool
      * objects) in one burst, up to `maxMs`. The idle drain correctly yields while the
      * camera moves, so a 3D entry started right after load races it — and losing the

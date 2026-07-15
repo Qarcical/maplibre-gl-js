@@ -6,7 +6,7 @@ import {SegmentVector} from '../data/segment';
 import {RasterBoundsArray, PosArray, TriangleIndexArray, LineStripIndexArray} from '../data/array_types.g';
 import rasterBoundsAttributes from '../data/raster_bounds_attributes';
 import posAttributes from '../data/pos_attributes';
-import {type ProgramConfiguration} from '../data/program_configuration';
+import {ProgramConfiguration} from '../data/program_configuration';
 import {CrossTileSymbolIndex} from '../symbol/cross_tile_symbol_index';
 import {shaders} from '../shaders/shaders';
 import {Program} from '../webgl/program';
@@ -151,6 +151,8 @@ export class Painter {
     _terrainWarmRecording: boolean;
     /** map2 fork: 2D compiles whose /terrain twin hasn't been warmed yet */
     _terrainWarmPending: Array<{name: string; configuration: ProgramConfiguration | null; defines: string[]}>;
+    /** map2 fork: variant keys already seeded from the style (seedTerrainWarmFromStyle re-calls dedupe here) */
+    _terrainWarmSeeded: Set<string>;
     /**
      * map2 fork: pre-allocated / preserved RTT pool framebuffer+texture pairs. Pool
      * object allocation measured 8–99ms EACH on Adreno (the ~280ms first-terrain
@@ -187,6 +189,7 @@ export class Painter {
         this.renderMode = '2d';
         this._terrainWarmRecording = false;
         this._terrainWarmPending = [];
+        this._terrainWarmSeeded = new Set();
         this._poolStash = [];
         this._poolStashBytes = 0;
         // desktop-class devices (Chromium deviceMemory reports 8 = "8 or more") can
@@ -898,6 +901,126 @@ export class Painter {
             if (this._getOrCompileProgram(candidate.name, candidate.configuration, true, false, candidate.defines).compiled) return true;
         }
         return false;
+    }
+
+    /**
+     * map2 fork: seed the terrain warm queue from the STYLE itself. Recording 2D
+     * compiles (useProgram) structurally can't see variants that only ever draw in
+     * 3D — photo symbols and anim overlays first draw mid-flight, and their in-frame
+     * compiles are the item-(a) residue (44–91ms singles on Adreno at Play entry).
+     * This derives each layer's program name(s) and a ProgramConfiguration straight
+     * from its evaluated paint declarations, exactly as the worker's bucket build
+     * would, so the queue covers every variant the style can request whether or not
+     * 2D ever drew it. Requires paint to be evaluated (call after the map's 'load');
+     * re-calls are cheap — seeded keys dedupe persistently, and a candidate whose
+     * twin is already compiled costs one cache probe at drain time.
+     * @returns the number of newly queued candidates
+     */
+    seedTerrainWarmFromStyle(): number {
+        if (!this.style) return 0;
+        const zoom = this.transform ? this.transform.zoom : 0;
+        let seeded = 0;
+        const push = (name: string, configuration: ProgramConfiguration | null, defines: string[] = []) => {
+            const key = name + (configuration ? configuration.cacheKey : '') + (defines.length ? `/${defines.join('/')}` : '');
+            if (this._terrainWarmSeeded.has(key)) return;
+            this._terrainWarmSeeded.add(key);
+            this._terrainWarmPending.push({name, configuration, defines});
+            seeded++;
+        };
+        for (const layerId of this.style._order) {
+            const layer = this.style._layers[layerId] as any;
+            // deliberately NO visibility skip: visibility is a runtime toggle, and the
+            // anim overlay layers — the variants this seeding exists for — ship
+            // 'none' and only flip visible at anim enter (field-caught 2026-07-15:
+            // the skip excluded exactly them). A genuinely-dead hidden layer costs
+            // one idle-time compile.
+            if (!layer) continue;
+            try {
+                switch (layer.type) {
+                    case 'circle':
+                        push('circle', new ProgramConfiguration(layer, zoom, () => true));
+                        break;
+                    case 'heatmap':
+                        push('heatmap', new ProgramConfiguration(layer, zoom, () => true));
+                        break;
+                    case 'line': {
+                        const dasharray = layer.paint.get('line-dasharray').constantOr(1);
+                        const image = layer.paint.get('line-pattern').constantOr(1);
+                        const gradient = layer.paint.get('line-gradient');
+                        const configuration = new ProgramConfiguration(layer, zoom, () => true);
+                        push(image ? 'linePattern' :
+                            dasharray && gradient ? 'lineGradientSDF' :
+                                dasharray ? 'lineSDF' :
+                                    gradient ? 'lineGradient' : 'line', configuration);
+                        // trim-mode grow sets a line-gradient at RUNTIME (after any warm
+                        // drain), which changes the program name but not the configuration.
+                        // lineMetrics on the layer's GeoJSON source is trim's own
+                        // precondition, so it is exactly the "could this happen" test.
+                        if (!image && !gradient && this._sourceHasLineMetrics(layer.source)) {
+                            push(dasharray ? 'lineGradientSDF' : 'lineGradient', configuration);
+                        }
+                        break;
+                    }
+                    case 'fill': {
+                        const image = layer.paint.get('fill-pattern').constantOr(1);
+                        const configuration = new ProgramConfiguration(layer, zoom, () => true);
+                        push(image ? 'fillPattern' : 'fill', configuration);
+                        if (layer.paint.get('fill-antialias')) {
+                            push(image && !layer.getPaintProperty('fill-outline-color') ? 'fillOutlinePattern' : 'fillOutline', configuration);
+                        }
+                        break;
+                    }
+                    case 'fill-extrusion': {
+                        const image = layer.paint.get('fill-extrusion-pattern').constantOr(1);
+                        push(image ? 'fillExtrusionPattern' : 'fillExtrusion', new ProgramConfiguration(layer, zoom, () => true));
+                        break;
+                    }
+                    case 'symbol': {
+                        if (layer._unevaluatedLayout.hasValue('text-field')) {
+                            push('symbolSDF', new ProgramConfiguration(layer, zoom, (property: string) => property.startsWith('text')));
+                        }
+                        if (layer._unevaluatedLayout.hasValue('icon-image')) {
+                            // SDF-ness of the icons is a bucket fact (which images the
+                            // features resolve to) — unknowable style-side, so seed both
+                            const configuration = new ProgramConfiguration(layer, zoom, (property: string) => property.startsWith('icon'));
+                            push('symbolIcon', configuration);
+                            push('symbolSDF', configuration);
+                        }
+                        break;
+                    }
+                    case 'background':
+                        push(layer.paint.get('background-pattern') ? 'backgroundPattern' : 'background', null);
+                        break;
+                    case 'raster':
+                        push('raster', null);
+                        break;
+                    case 'color-relief':
+                        push('colorRelief', null);
+                        break;
+                    case 'hillshade':
+                        push('hillshade', null, [`#define NUM_ILLUMINATION_SOURCES ${layer.paint.get('hillshade-highlight-color').values.length}`]);
+                        push('hillshadePrepare', null);
+                        break;
+                }
+            } catch {
+                // a layer we can't derive (e.g. paint not yet evaluated) is skipped —
+                // the 2D recording path still covers anything 2D eventually draws
+            }
+        }
+        if (this.style.sky) {
+            push('sky', null);
+        }
+        // drawn on every terrain frame regardless of style content
+        push('clippingMask', null);
+        push('depth', null);
+        return seeded;
+    }
+
+    /** map2 fork: is this layer's source a GeoJSON source built with lineMetrics? (trim-mode precondition) */
+    _sourceHasLineMetrics(sourceId: string | undefined): boolean {
+        if (!sourceId || !this.style) return false;
+        const source = this.style.getSource(sourceId) as {workerOptions?: {geojsonVtOptions?: {lineMetrics?: boolean}}};
+        return !!source?.workerOptions?.geojsonVtOptions?.lineMetrics;
     }
 
     /** map2 fork: hand a stashed framebuffer+texture pair to a RenderPool (see _poolStash) */

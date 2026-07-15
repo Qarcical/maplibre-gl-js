@@ -2,6 +2,7 @@ import {describe, beforeEach, test, expect, vi} from 'vitest';
 import {Painter} from './painter';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
 import {Style} from '../style/style';
+import {createStyleLayer} from '../style/create_style_layer';
 import {StubMap} from '../util/test/util';
 import {Texture} from '../webgl/texture';
 
@@ -158,5 +159,81 @@ describe('terrain shader warm-up', () => {
         map.terrain = {};
         const {compiled} = painter._getOrCompileProgram('fillOutline', null, true, false, []);
         expect(compiled).toBe(false);
+    });
+});
+
+// PATCH (map2-fork): style-derived warm seeding — recording 2D compiles can't see
+// variants that only ever draw in 3D (photo symbols, anim overlays), so their program
+// name + configuration is derived from the style declarations instead and queued for
+// the same idle/burst drain (see Map#seedTerrainProgramsFromStyle).
+describe('style-derived terrain warm seeding', () => {
+    function createPainterWithStyle() {
+        const gl = document.createElement('canvas').getContext('webgl');
+        const transform = new MercatorTransform({minZoom: 0, maxZoom: 22, minPitch: 0, maxPitch: 60, renderWorldCopies: true});
+        transform.resize(512, 512);
+        const painter = new Painter(gl, transform);
+        const style = new Style(new StubMap() as any);
+        style._setProjectionInternal('mercator');
+        painter.style = style;
+        painter.context.gl.isContextLost = () => false;   // the mock GL reports lost
+        return {painter, style};
+    }
+
+    test('seeds 3D-only variants from style declarations and drains them', () => {
+        const {painter, style} = createPainterWithStyle();
+
+        // an anim-track-like layer: data-driven color, lineMetrics GeoJSON source —
+        // trim mode sets its line-gradient at runtime, AFTER any warm drain
+        const animTrack = createStyleLayer({
+            id: 'overlay-anim-track', type: 'line', source: 'anim-track',
+            paint: {'line-color': ['match', ['get', 'mode'], 'walk', '#123456', '#654321'], 'line-width': 3}
+        } as any, {});
+        // a photo-symbol-like layer that only ever draws in 3D
+        const photos = createStyleLayer({
+            id: 'photos', type: 'symbol', source: 'photos',
+            layout: {'icon-image': ['get', 'img']},
+            paint: {'icon-halo-color': '#fff'}
+        } as any, {});
+        // layout-hidden layers MUST still seed: visibility is a runtime toggle, and the
+        // anim overlays ship 'none' until anim enter (distinctive via dasharray → lineSDF)
+        const hidden = createStyleLayer({
+            id: 'hidden', type: 'line', source: 'other',
+            layout: {visibility: 'none'},
+            paint: {'line-dasharray': [2, 2]}
+        } as any, {});
+        for (const layer of [animTrack, photos, hidden]) {
+            layer.recalculate({zoom: 10, zoomHistory: {}} as any, []);
+        }
+        style._order = ['overlay-anim-track', 'photos', 'hidden'];
+        style._layers = {'overlay-anim-track': animTrack, photos, hidden} as any;
+        style.getSource = ((id: string) =>
+            id === 'anim-track' ? {workerOptions: {geojsonVtOptions: {lineMetrics: true}}} : undefined) as any;
+
+        const seeded = painter.seedTerrainWarmFromStyle();
+        expect(seeded).toBeGreaterThan(0);
+        const names = painter._terrainWarmPending.map(c => c.name);
+        expect(names).toContain('line');
+        // the runtime trim gradient is anticipated via the source's lineMetrics
+        expect(names).toContain('lineGradient');
+        // icon SDF-ness is a bucket fact — both icon programs seed
+        expect(names).toContain('symbolIcon');
+        expect(names).toContain('symbolSDF');
+        expect(names).toContain('clippingMask');
+        // the hidden layer seeds too — visibility can flip at runtime
+        expect(names).toContain('lineSDF');
+        // the seeded configuration carries the data-driven binder layout
+        const gradient = painter._terrainWarmPending.find(c => c.name === 'lineGradient');
+        expect(gradient.configuration.cacheKey).toContain('/a_line-color');
+
+        // the drain compiles the /terrain twins the recording path never saw
+        while (painter.warmTerrainProgram()) {}
+        const terrainKeys = Object.keys(painter.cache).filter(k => k.includes('/terrain'));
+        expect(terrainKeys.some(k => k.startsWith('lineGradient') && k.includes('/a_line-color'))).toBe(true);
+        expect(terrainKeys.some(k => k.startsWith('symbolSDF'))).toBe(true);
+        expect(terrainKeys.some(k => k.startsWith('symbolIcon'))).toBe(true);
+
+        // re-seeding is a no-op: every variant key is already known
+        expect(painter.seedTerrainWarmFromStyle()).toBe(0);
+        expect(painter._terrainWarmPending).toHaveLength(0);
     });
 });
