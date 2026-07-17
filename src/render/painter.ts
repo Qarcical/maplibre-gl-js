@@ -585,6 +585,7 @@ export class Painter {
 
         if (glStats.enabled) {
             glStats.frame.tileUploadsGranted = this.uploadScheduler.granted;
+            glStats.frame.tileUploadsExempt = this.uploadScheduler.exemptGranted;
             glStats.frame.tileUploadsDeferred = this.uploadScheduler.deferred;
             glStats.frame.tileUploadMs = this.uploadScheduler.uploadMs;
             glStats.frame.tileUploadBudgetMs = this.uploadScheduler.budgetMs;

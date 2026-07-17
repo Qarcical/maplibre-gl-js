@@ -45,6 +45,19 @@ describe('UploadScheduler', () => {
         expect(s.budgetMs).toBeGreaterThan(noBacklog * 2);
     });
 
+    test('the backlog scale-up is suppressed while the camera moves', () => {
+        const s = new UploadScheduler();
+        for (let i = 0; i < 100; i++) s.onFrameEnd(12);
+        s.onFrameStart(16.7);
+        const base = s.budgetMs;
+        for (let i = 0; i < 64; i++) s.noteDeferred();
+        s.onFrameStart(16.7, true);                      // moving: no scale-up
+        expect(s.budgetMs).toBeCloseTo(base, 5);
+        for (let i = 0; i < 64; i++) s.noteDeferred();
+        s.onFrameStart(16.7, false);                     // settled: scale-up resumes
+        expect(s.budgetMs).toBeGreaterThan(base * 2);
+    });
+
     test('greedy spend: grants stop once the budget is spent', () => {
         const s = new UploadScheduler();
         s.onFrameStart(16.7);                            // no EMA yet → budget from half-period seed
@@ -78,6 +91,51 @@ describe('UploadScheduler', () => {
         expect(s.hasBudget()).toBe(false);               // fully debited...
         s.onFrameStart(16.7);
         expect(s.hasBudget()).toBe(true);                // ...but consumed once, not carried forever
+    });
+
+    test('exemption slots cap per frame and refresh on onFrameStart', () => {
+        const s = new UploadScheduler();
+        s.exemptGrantCap = 2;
+        s.onFrameStart(16.7);
+        expect(s.tryExemptGrant()).toBe(true);
+        expect(s.tryExemptGrant()).toBe(true);
+        expect(s.tryExemptGrant()).toBe(false);              // cap reached
+        expect(s.exemptGranted).toBe(2);                     // failed claim does not count
+        s.onFrameStart(16.7);
+        expect(s.exemptGranted).toBe(0);
+        expect(s.tryExemptGrant()).toBe(true);
+    });
+
+    test('exemptGrantCap <= 0 means unlimited exemption grants', () => {
+        const s = new UploadScheduler();
+        s.exemptGrantCap = 0;
+        s.onFrameStart(16.7);
+        for (let i = 0; i < 100; i++) {
+            expect(s.tryExemptGrant()).toBe(true);
+        }
+    });
+
+    test('grant capacity is bounded by count even with time budget remaining', () => {
+        const s = new UploadScheduler();
+        s.grantCountCap = 2;
+        s.onFrameStart(16.7);
+        expect(s.hasGrantCapacity()).toBe(true);
+        s.noteGranted(0.1);                                  // cheap tiles: time is not the limiter
+        s.noteGranted(0.1);
+        expect(s.hasBudget()).toBe(true);
+        expect(s.hasGrantCapacity()).toBe(false);            // count cap reached
+        s.onFrameStart(16.7);
+        expect(s.hasGrantCapacity()).toBe(true);             // refreshes per frame
+    });
+
+    test('grantCountCap <= 0 means capacity is time-budget only', () => {
+        const s = new UploadScheduler();
+        s.grantCountCap = 0;
+        s.onFrameStart(16.7);
+        for (let i = 0; i < 100; i++) s.noteGranted(0.01);
+        expect(s.hasGrantCapacity()).toBe(true);
+        s.noteGranted(1000);                                 // time budget spent
+        expect(s.hasGrantCapacity()).toBe(false);
     });
 
     test('updateVolatileSources collects sources with the rtt-stack-break metadata', () => {

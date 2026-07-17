@@ -2676,6 +2676,101 @@ describe('TileManager upload spreading', () => {
         expect(tile.gatedUpload).toBe(false);
     });
 
+    test('no-substitute exemption grants are capped per frame and refresh next frame', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.exemptGrantCap = 3;
+        // 8 siblings: none is an ancestor/descendant of another, so none has a substitute
+        // — the synchronized-promotion shape (a preloaded viewport arriving all at once)
+        const tiles = [];
+        for (let i = 0; i < 8; i++) {
+            tiles.push(makeTile(new OverscaledTileID(3, 0, 3, i, 0), true));
+        }
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);           // budget spent: only exemption slots grant
+        tileManager.prepare(context);
+        expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(3);
+        expect(scheduler.exemptGranted).toBe(3);
+        expect(scheduler.deferred).toBe(5);
+
+        scheduler.onFrameStart(16.7);          // slots refresh
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(6);
+    });
+
+    test('coarse exemption grants become the substitutes that defer the finer tiles', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const parent = makeTile(new OverscaledTileID(0, 0, 0, 0, 0), true);
+        const children = [];
+        for (let x = 0; x < 2; x++) {
+            for (let y = 0; y < 2; y++) {
+                children.push(makeTile(new OverscaledTileID(1, 0, 1, x, y), true));
+            }
+        }
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        // coarse-first order grants the parent on one exemption slot; the children then
+        // see a renderable ancestor and defer normally, with exemption slots to spare
+        expect(parent.gatedUpload).toBe(false);
+        expect(children.every((t) => t.gatedUpload)).toBe(true);
+        expect(scheduler.exemptGranted).toBe(1);
+        expect(scheduler.deferred).toBe(4);
+    });
+
+    test('grant count cap bounds a backlog even with time budget remaining', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.grantCountCap = 3;
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);   // renderable substitute for all
+        const tiles = [];
+        for (let i = 0; i < 8; i++) {
+            tiles.push(makeTile(new OverscaledTileID(3, 0, 3, i, 0), true));
+        }
+
+        scheduler.onFrameStart(16.7);           // fresh budget — time is NOT the limiter
+        tileManager.prepare(context);
+        expect(scheduler.hasBudget()).toBe(true);
+        expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(3);
+        expect(scheduler.deferred).toBe(5);
+
+        scheduler.onFrameStart(16.7);           // count refreshes next frame
+        tileManager.prepare(context);
+        expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(6);
+    });
+
+    test('no-substitute tiles still grant via exemption once the count cap is reached', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.grantCountCap = 1;
+        const tiles = [];
+        for (let i = 0; i < 3; i++) {
+            tiles.push(makeTile(new OverscaledTileID(3, 0, 3, i, 0), true));
+        }
+
+        scheduler.onFrameStart(16.7);
+        tileManager.prepare(context);
+        // first grant takes the count slot; the siblings have no substitute, so the
+        // exemption path (its own cap) still lets them through — blank is worse
+        expect(tiles.every((t) => !t.gatedUpload)).toBe(true);
+        expect(scheduler.granted).toBe(3);
+        expect(scheduler.exemptGranted).toBe(2);
+    });
+
+    test('exemptGrantCap <= 0 restores unbounded exemption grants', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        scheduler.exemptGrantCap = 0;
+        const tiles = [];
+        for (let i = 0; i < 8; i++) {
+            tiles.push(makeTile(new OverscaledTileID(3, 0, 3, i, 0), true));
+        }
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);
+        tileManager.prepare(context);
+        expect(tiles.every((t) => !t.gatedUpload)).toBe(true);
+    });
+
     test('volatile sources bypass the budget', () => {
         const {scheduler, tileManager, makeTile, context} = createGatedSetup();
         scheduler.volatileSources.add('id');   // the mock manager's source id

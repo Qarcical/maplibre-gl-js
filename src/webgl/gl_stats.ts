@@ -80,6 +80,8 @@ export type GlStatsFrame = {
     programCompileMs: number;
     /** tiles whose gated first upload the scheduler granted this frame */
     tileUploadsGranted: number;
+    /** subset of granted: no-substitute exemption grants (capped per frame) */
+    tileUploadsExempt: number;
     /** gated tiles left waiting at frame end (drains at ~budget/emaTileMs per frame) */
     tileUploadsDeferred: number;
     /** ms the granted uploads actually took this frame */
@@ -117,6 +119,7 @@ function zeroFrame(): GlStatsFrame {
         programCompiles: 0,
         programCompileMs: 0,
         tileUploadsGranted: 0,
+        tileUploadsExempt: 0,
         tileUploadsDeferred: 0,
         tileUploadMs: 0,
         tileUploadBudgetMs: 0,

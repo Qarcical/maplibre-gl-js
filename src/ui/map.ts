@@ -597,6 +597,12 @@ export class Map extends Camera {
     _frameRateTier: number = 0;
     _tierHeadroomStreak: number = 0;
     _stepUpBlockedUntil: number = 0;
+    /**
+     * map2 fork: governor demotions are suppressed until this timestamp (see
+     * {@link Map#holdFrameRateTier}) — scripted-transition transients must not
+     * buy the 10s step-up cooldown.
+     */
+    _frameRateHoldUntil: number = 0;
     _framePerf: Array<{cpu: number; gpu: number; depth: number}> = [];
     _pendingGpuFences: Array<{sync: WebGLSync; start: number; cpu: number; depth: number}> = [];
     _lastPromotionTime: number = 0;
@@ -3965,8 +3971,10 @@ export class Map extends Camera {
                     this._lastRenderTimestamp = paintStartTimeStamp;
                     const cpuStart = performance.now();
                     // budget the frame's gated tile uploads from the period the frame
-                    // actually has (governor cap, else the vsync estimate)
-                    this.painter.uploadScheduler.onFrameStart(this._effectiveFramePeriod());
+                    // actually has (governor cap, else the vsync estimate); isMoving
+                    // suppresses the backlog scale-up (detail latency is invisible
+                    // mid-motion, the scaled budget's spikes are not)
+                    this.painter.uploadScheduler.onFrameStart(this._effectiveFramePeriod(), this.isMoving());
                     try {
                         this._render(paintStartTimeStamp);
                     } catch(error) {
@@ -4028,6 +4036,28 @@ export class Map extends Camera {
      */
     getMaxFrameRate(): number {
         return this._maxFrameInterval > 0 ? 1000 / this._maxFrameInterval : 0;
+    }
+
+    /**
+     * map2 fork: suppress the frame-rate governor's DEMOTIONS for the next
+     * `durationMs` ms (promotions are unaffected). For scripted transitions the
+     * app knows about — track-to-track flyTos, the terrain install — whose
+     * cpu/queue transients are camera-masked: letting one demote the governor
+     * buys the 10s step-up cooldown, field-measured as a whole follow-cam track
+     * captive at 30fps while its frames ran 9–11ms. If the workload AFTER the
+     * hold genuinely can't sustain the tier, the very next decision window
+     * demotes as normal. Repeat calls extend (the furthest deadline wins);
+     * `holdFrameRateTier(0)` cancels an active hold.
+     *
+     * @param durationMs - how long to suppress demotions, from now
+     */
+    holdFrameRateTier(durationMs: number): this {
+        if (durationMs <= 0) {
+            this._frameRateHoldUntil = 0;
+        } else {
+            this._frameRateHoldUntil = Math.max(this._frameRateHoldUntil, performance.now() + durationMs);
+        }
+        return this;
     }
 
     /**
@@ -4195,6 +4225,37 @@ export class Map extends Camera {
      */
     setUploadSpreading(on: boolean): this {
         this.painter.uploadScheduler.enabled = !!on;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: per-frame cap on the upload spreader's no-substitute exemption
+     * grants (default UploadScheduler.DEFAULT_EXEMPT_GRANT_CAP). The exemption
+     * exists so first paint of a region is never deferred into blankness, but a
+     * preloaded viewport promoting all at once (flyTo arrival) has NO renderable
+     * ladder, so unbounded exemption grants re-created the single-frame upload
+     * burst the spreader exists to prevent. cap <= 0 removes the cap (the
+     * `?nograntcap` A/B in the challenge app).
+     */
+    setUploadExemptGrantCap(cap: number): this {
+        this.painter.uploadScheduler.exemptGrantCap = cap;
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
+     * map2 fork: per-frame cap on the upload spreader's grant COUNT (default
+     * UploadScheduler.DEFAULT_GRANT_COUNT_CAP). The time budget alone cannot
+     * bound a synchronized-promotion backlog: the measured upload time is only
+     * the GL call issue time and undercounts a grant's true frame cost (RTT
+     * drape invalidation, symbol placement, driver-deferred work), so a
+     * backlog-scaled budget admitted ~98 grants in one 88.7ms frame. cap <= 0
+     * removes the cap (the `?nograntcap` A/B in the challenge app). Volatile
+     * sources and the no-substitute exemption path are not bound by it.
+     */
+    setUploadGrantCountCap(cap: number): this {
+        this.painter.uploadScheduler.grantCountCap = cap;
         this.triggerRepaint();
         return this;
     }
@@ -4668,6 +4729,11 @@ export class Map extends Camera {
         const tier = Math.min(this._frameRateTier, divisors.length - 1);
         let newTier = tier;
         if (tier < divisors.length - 1 &&
+            // map2 fork: demotion suppressed while a transition hold is active
+            // (holdFrameRateTier) — the app declares scripted flights/installs
+            // whose camera-masked transients otherwise buy the step-up cooldown.
+            // Promotion below is unaffected.
+            now >= this._frameRateHoldUntil &&
             (cpuMedian > vsync * divisors[tier] * 1.05 ||
              depthMedian >= 5 ||
              (depthMedian >= 3 && depthGrowing))) {

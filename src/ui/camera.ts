@@ -1749,7 +1749,46 @@ export abstract class Camera extends Evented {
             sampleHandler.easeFunc(k, 1 / prep.w(s), prep.u(s), trSample.centerPoint.add(prep.offsetAsPoint));
             samples.push(trSample);
         }
+
+        // PATCH (map2-fork): mid-path samples preload COARSE — only the destination
+        // (the last sample, k=1) keeps full detail. The fine rings near either end of
+        // a flight (destZoom−1, −2) are each on screen for well under a second while
+        // the camera sweeps through, but they dominate the preload tile count — field
+        // capture 2026-07-16 (Surface, 3-track peaks run): 185 preloaded tiles
+        // TTL-released never-promoted per run, and the ~100-tile promotion backlog at
+        // flyTo settle held the frame-cpu MEDIAN over the governor's demote line for
+        // ~2s even with per-frame grant caps spreading the uploads. Clamping mid-path
+        // samples to destZoom − drop keeps the cheap coarse rings (few tiles, and
+        // they're the drape substitutes retention wants) and drops only the transient
+        // fine rings; mid-flight then renders coarse from the pinned parents — the
+        // same thing the (field-proven smooth) no-prefetch behaviour shows.
+        if (this._pathPreloadCoarseDrop > 0 && samples.length > 1) {
+            const destZoom = samples[samples.length - 1].zoom;
+            for (let i = 0; i < samples.length - 1; i++) {
+                const clamped = Math.min(samples[i].zoom, destZoom - this._pathPreloadCoarseDrop);
+                if (clamped < samples[i].zoom) {
+                    samples[i].setZoom(clamped);
+                }
+            }
+        }
         return samples;
+    }
+
+    /**
+     * PATCH (map2-fork): how many zoom levels below the DESTINATION zoom the
+     * mid-path flight-preload samples are clamped to (see _sampleFlightPath).
+     * <= 0 disables the clamp (mid-path samples preload at full ring zoom — the
+     * `?nopathclamp` A/B in the challenge app).
+     */
+    _pathPreloadCoarseDrop: number = 2.5;
+
+    /**
+     * PATCH (map2-fork): override the mid-path preload coarse clamp (see
+     * _sampleFlightPath). drop <= 0 disables clamping.
+     */
+    setPathPreloadCoarseDrop(drop: number): this {
+        this._pathPreloadCoarseDrop = drop;
+        return this;
     }
 
     // PATCH (map2-fork): preload the tiles for a flyTo's ENTIRE path without flying it — for a

@@ -4031,3 +4031,33 @@ describe('zoomSnap', () => {
         expect(camera.getZoom()).toBe(10.0);
     });
 });
+
+// PATCH (map2-fork): mid-path flight-preload samples are clamped coarse — only the
+// destination sample keeps full detail (see _sampleFlightPath)
+describe('flight path preload coarse clamp', () => {
+    function samplesForLongFlight(camera) {
+        const prep = (camera as any)._prepareFlight({center: [10, 0], zoom: 14}, camera.transform.clone());
+        expect(prep).toBeTruthy();
+        return (camera as any)._sampleFlightPath(prep);
+    }
+
+    test('mid-path samples are clamped to destZoom − drop; the destination keeps full zoom', () => {
+        const camera = createCamera();
+        camera.jumpTo({center: [0, 0], zoom: 14});
+        const samples = samplesForLongFlight(camera);
+        expect(samples.length).toBeGreaterThan(2);
+        expect(samples[samples.length - 1].zoom).toBeCloseTo(14, 1);
+        for (let i = 0; i < samples.length - 1; i++) {
+            expect(samples[i].zoom).toBeLessThanOrEqual(14 - 2.5 + 1e-9);
+        }
+    });
+
+    test('setPathPreloadCoarseDrop(0) disables the clamp (fine rings sample at full zoom)', () => {
+        const camera = createCamera();
+        camera.jumpTo({center: [0, 0], zoom: 14});
+        camera.setPathPreloadCoarseDrop(0);
+        const samples = samplesForLongFlight(camera);
+        const midMax = Math.max(...samples.slice(0, -1).map((t) => t.zoom));
+        expect(midMax).toBeGreaterThan(14 - 2.5);
+    });
+});

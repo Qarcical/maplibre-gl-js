@@ -260,8 +260,9 @@ export class TileManager extends Evented {
      * time budget — coarse zooms first (one parent unlocks a whole region's coverage),
      * then viewport-centre-out. A denied tile stays non-renderable, so the retention
      * machinery keeps drawing the covering parent/child; grants beyond the budget go
-     * to volatile (per-frame anim) sources and to tiles with no renderable substitute,
-     * where a deferral would lag the grow head or leave the region blank.
+     * to volatile (per-frame anim) sources and — capped per frame, see
+     * UploadScheduler.tryExemptGrant — to tiles with no renderable substitute, where
+     * a deferral would lag the grow head or leave the region blank.
      */
     _uploadGatedTiles(gated: Tile[], context: Context) {
         const scheduler = this.map.painter.uploadScheduler;
@@ -286,8 +287,14 @@ export class TileManager extends Evented {
         }
 
         for (const tile of gated) {
-            // budget check first — the substitute scan only runs once the budget is spent
-            if (!volatile && !scheduler.hasBudget() && this._hasRenderableSubstitute(tile.tileID)) {
+            // capacity check first (time budget AND grant count — see the scheduler's
+            // class doc; the substitute scan only runs once capacity is spent). Past
+            // capacity, a tile grants only if nothing renderable covers it AND an
+            // exemption slot is free this frame: a preloaded viewport promoting all
+            // at once has no renderable ladder at all, and unbounded no-substitute
+            // grants re-created the single-frame burst the budget exists to prevent.
+            if (!volatile && !scheduler.hasGrantCapacity() &&
+                (this._hasRenderableSubstitute(tile.tileID) || !scheduler.tryExemptGrant())) {
                 scheduler.noteDeferred();
                 continue;
             }
