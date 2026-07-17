@@ -147,6 +147,9 @@ function prepareHillshade(
 
             fbo = tile.fbo = context.createFramebuffer(tileSize, tileSize, true, false);
             fbo.colorAttachment.set(renderTexture.texture);
+            // The wrapper isn't retained anywhere else — hand it to the fbo so
+            // unloadTile's fbo.destroy() decrements the glMem gauge (see Framebuffer).
+            fbo.colorTexture = renderTexture;
         }
 
         context.bindFramebuffer.set(fbo.framebuffer);

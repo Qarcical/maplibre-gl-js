@@ -230,4 +230,26 @@ describe('LineBucket', () => {
         expect(Math.min(...progresses)).toBeCloseTo(0.5, 5);
         expect(Math.max(...progresses)).toBeCloseTo(1.0, 5);
     });
+
+    test('destroy() frees draw-time gradient ramp textures (map2 fork)', () => {
+        // getGradientTexture (draw_line) lazily hangs a ramp Texture off
+        // bucket.gradients[layer.id]; the bucket owns it, so destroy() must free
+        // it — stock leaked one small GL texture per drawn line-gradient bucket.
+        const bucket = createLineBucket({id: 'test'});
+        const stub = () => ({destroy: vi.fn()});
+        const gradientTexture = {destroy: vi.fn()};
+        bucket.layoutVertexBuffer = stub() as any;
+        bucket.indexBuffer = stub() as any;
+        bucket.programConfigurations = stub() as any;
+        bucket.segments = stub() as any;
+        bucket.gradients = {
+            withTexture: {texture: gradientTexture as any},
+            rampOnly: {},   // gradient rendered but never drawn — no texture yet
+        };
+
+        bucket.destroy();
+
+        expect(gradientTexture.destroy).toHaveBeenCalledTimes(1);
+        expect(bucket.gradients).toEqual({});
+    });
 });

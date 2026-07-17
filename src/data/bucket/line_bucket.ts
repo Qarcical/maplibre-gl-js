@@ -245,6 +245,14 @@ export class LineBucket implements Bucket {
 
     destroy() {
         if (!this.layoutVertexBuffer) return;
+        // map2 fork: gradient ramp textures are created lazily at draw time
+        // (draw_line's getGradientTexture) and owned by this bucket — stock never
+        // destroyed them, leaking one small GL texture per drawn line-gradient
+        // bucket (the glstats texCount creep, ~5/s through a follow-cam run).
+        for (const id in this.gradients) {
+            this.gradients[id].texture?.destroy();
+        }
+        this.gradients = {};
         this.layoutVertexBuffer.destroy();
         this.indexBuffer.destroy();
         this.programConfigurations.destroy();
