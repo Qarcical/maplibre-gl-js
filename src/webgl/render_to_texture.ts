@@ -134,6 +134,12 @@ export class RenderToTexture {
      * remaining dirty-entry re-renders this frame (see SOFT_RERENDERS_PER_FRAME)
      */
     _softRerenderBudget: number;
+    /**
+     * fill-extrusion layers whose live draw is deferred until the draped stack that
+     * surrounds them has composited (see renderLayer) — flushed at the end of each
+     * _renderStack, or before the next live layer if no stack was open around them
+     */
+    _deferredExtrusions: StyleLayer[];
     constructor(painter: Painter, terrain: Terrain) {
         this.painter = painter;
         this.terrain = terrain;
@@ -161,6 +167,7 @@ export class RenderToTexture {
         ];
         this._pendingSourceTileChanges = [];
         this._softRerenderBudget = 0;
+        this._deferredExtrusions = [];
     }
 
     destruct() {
@@ -238,6 +245,7 @@ export class RenderToTexture {
         this._stacks = [];
         this._prevType = null;
         this._rttTiles = [];
+        this._deferredExtrusions = [];
         this._renderableTiles = this.terrain.tileManager.getRenderableTiles();
         // mode-hidden layers (map2:visible-when) are excluded here, so they contribute no
         // stack content, no pool demand, and — for live layers — no stack SPLIT; their
@@ -437,18 +445,23 @@ export class RenderToTexture {
         // layer is that surface's texture, so it can never paint onto the extrusion — the
         // depth test keeps the building in front of any later drape composite — which makes
         // draped paint order AROUND an extrusion visually meaningless on terrain. So it need
-        // not split the draped run into a separate stack: draw it live in place but leave
-        // _prevType and the open stack untouched, and the drapes on both sides merge into ONE
-        // stack + texture. This is mirrored in the stack-signature builder in prepareForRender
-        // (the two must agree or stack invalidation desyncs from what actually rendered).
-        // Exception: when it's the last renderable layer there's no following drape to merge
-        // with and the pending stack still needs compositing, so fall through to the normal
-        // path. NB the merged stack composites AFTER the building has drawn — correct for
-        // opaque buildings (depth protects them, exactly as they already survive a later
-        // stack's composite today); a translucent extrusion mid-zoom-fade would blend against
-        // pre-stack content instead of the merged ground (accepted — opaque at follow-cam zoom).
+        // not split the draped run into a separate stack: leave _prevType and the open stack
+        // untouched so the drapes on both sides merge into ONE stack + texture. This is
+        // mirrored in the stack-signature builder in prepareForRender (the two must agree or
+        // stack invalidation desyncs from what actually rendered). The live draw is DEFERRED
+        // until the merged stack has composited: a translucent extrusion (mid zoom-fade)
+        // must alpha-blend against the ground drape behind it — drawn before the composite
+        // it blends against the framebuffer clear instead, and the later composite is
+        // depth-rejected behind it, so the fade band showed the page background through the
+        // buildings. Drawing after the composite is depth-safe by the same argument as
+        // before: the building stands above the surface, so it wins the depth test over the
+        // drape regardless of order. Exception: when it's the last renderable layer there's
+        // no following drape to merge with and the pending stack still needs compositing, so
+        // fall through to the normal path (which composites, then the painter draws it live
+        // — already the correct order).
         if (type === 'fill-extrusion' && !isLastLayer) {
-            return false;
+            this._deferredExtrusions.push(layer);
+            return true;
         }
 
         // remember background, fill, line & raster layer to render into a stack
@@ -475,7 +488,29 @@ export class RenderToTexture {
             return LAYERS_TO_TEXTURES[type];
         }
 
+        // a live layer with no draped run open around the pending extrusions — no stack
+        // composite is coming to flush them, so draw them now to keep style order
+        this._flushDeferredExtrusions(renderOptions);
         return false;
+    }
+
+    /**
+     * draw the deferred fill-extrusion layers live, in style order, now that the stack
+     * that surrounds them has composited to the main framebuffer (drawTerrain leaves
+     * the main framebuffer + full viewport bound). Extrusions are not tile-clipped, so
+     * no stencil mask stamping is needed — this mirrors the painter's live-draw call.
+     */
+    _flushDeferredExtrusions(renderOptions: RenderOptions) {
+        if (!this._deferredExtrusions.length) return;
+        const painter = this.painter;
+        const layers = this._deferredExtrusions;
+        this._deferredExtrusions = [];
+        const options: RenderOptions = {...renderOptions, isRenderingToTexture: false};
+        for (const layer of layers) {
+            const tileManager = painter.style.tileManagers[layer.source];
+            const coords = tileManager ? tileManager.getVisibleCoordinates(false).slice().reverse() : [];
+            painter.renderLayer(painter, tileManager, layer, coords, options);
+        }
     }
 
     /**
@@ -589,6 +624,9 @@ export class RenderToTexture {
         // the next tile-clipped layer to re-stamp
         painter.currentStencilSource = undefined;
         painter._clippingDisabled = false;
+        // the ground this stack composited is now behind any extrusion that sat inside
+        // the run — draw them live on top of it (translucent fades blend correctly)
+        this._flushDeferredExtrusions(options);
     }
 
     /**

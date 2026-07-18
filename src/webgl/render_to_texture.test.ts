@@ -68,6 +68,12 @@ describe('render to texture', () => {
         },
         isHidden: () => false
     } as any as SymbolStyleLayer;
+    const extrusionLayer = {
+        id: 'maine-extrusion',
+        type: 'fill-extrusion',
+        source: 'maine',
+        isHidden: () => false
+    } as any as FillStyleLayer;
 
     let layersDrawn = 0;
     const painter = {
@@ -117,7 +123,8 @@ describe('render to texture', () => {
             'maine-hillshade': hillshadeLayer,
             'maine-line': lineLayer,
             'maine-line-break': breakLineLayer,
-            'maine-symbol': symbolLayer
+            'maine-symbol': symbolLayer,
+            'maine-extrusion': extrusionLayer
         },
         projection: {
             transitionState: 0,
@@ -252,6 +259,68 @@ describe('render to texture', () => {
         expect(rtt._stacks).toStrictEqual([['maine-fill'], ['maine-line-break']]);
         // one terrain composite per stack, one tile each
         expect(layersDrawn).toBe(2);
+    });
+
+    test('mid-stack fill-extrusion defers its live draw until the merged stack composites', () => {
+        style._order = ['maine-fill', 'maine-extrusion', 'maine-line', 'maine-symbol'];
+        rtt.prepareForRender(style, 0);
+        layersDrawn = 0;
+        const renderOptions = {isRenderingToTexture: false, isRenderingGlobe: false};
+        const liveDraws: Array<{id: string; compositesAtDraw: number; rtt: boolean}> = [];
+        const renderLayerMock = painter.renderLayer as Mock;
+        renderLayerMock.mockImplementation((_p, _tm, layer, _coords, opts) => {
+            liveDraws.push({id: layer.id, compositesAtDraw: layersDrawn, rtt: opts.isRenderingToTexture});
+        });
+        try {
+            expect(rtt.renderLayer(fillLayer, renderOptions)).toBeTruthy();
+            // handled (deferred), not drawn live yet — and the stack stays open
+            expect(rtt.renderLayer(extrusionLayer, renderOptions)).toBeTruthy();
+            expect(liveDraws.filter(d => d.id === 'maine-extrusion')).toHaveLength(0);
+            expect(rtt.renderLayer(lineLayer, renderOptions)).toBeTruthy();
+            expect(rtt.renderLayer(symbolLayer, renderOptions)).toBeFalsy();
+            // the drapes on both sides merged into one stack
+            expect(rtt._stacks).toStrictEqual([['maine-fill', 'maine-line']]);
+            // the extrusion drew live exactly once, AFTER the stack's terrain composite
+            const extrusionDraws = liveDraws.filter(d => d.id === 'maine-extrusion');
+            expect(extrusionDraws).toHaveLength(1);
+            expect(extrusionDraws[0].rtt).toBe(false);
+            expect(extrusionDraws[0].compositesAtDraw).toBe(1);
+        } finally {
+            renderLayerMock.mockReset();
+        }
+    });
+
+    test('fill-extrusion as last renderable layer composites the pending stack first', () => {
+        style._order = ['maine-fill', 'maine-extrusion'];
+        rtt.prepareForRender(style, 0);
+        layersDrawn = 0;
+        const renderOptions = {isRenderingToTexture: false, isRenderingGlobe: false};
+        expect(rtt.renderLayer(fillLayer, renderOptions)).toBeTruthy();
+        // falls through to the normal path: stack composited, painter draws it live after
+        expect(rtt.renderLayer(extrusionLayer, renderOptions)).toBeFalsy();
+        expect(layersDrawn).toBe(1);
+    });
+
+    test('deferred fill-extrusion with no enclosing stack flushes before the next live layer', () => {
+        style._order = ['maine-symbol', 'maine-extrusion', 'maine-symbol'];
+        rtt.prepareForRender(style, 0);
+        layersDrawn = 0;
+        const renderOptions = {isRenderingToTexture: false, isRenderingGlobe: false};
+        const liveDraws: string[] = [];
+        const renderLayerMock = painter.renderLayer as Mock;
+        renderLayerMock.mockImplementation((_p, _tm, layer) => {
+            liveDraws.push(layer.id);
+        });
+        try {
+            expect(rtt.renderLayer(symbolLayer, renderOptions)).toBeFalsy();
+            expect(rtt.renderLayer(extrusionLayer, renderOptions)).toBeTruthy();
+            // no stack will composite — the next live layer's dispatch flushes it first
+            expect(rtt.renderLayer(symbolLayer, renderOptions)).toBeFalsy();
+            expect(liveDraws).toStrictEqual(['maine-extrusion']);
+            expect(layersDrawn).toBe(0);
+        } finally {
+            renderLayerMock.mockReset();
+        }
     });
 
     test('markSourceTileChanged invalidates only stacks draping the source', () => {
