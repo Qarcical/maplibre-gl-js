@@ -218,6 +218,10 @@ export class RenderToTexture {
     // the zoom adjust (see below). Undefined until the first prepareForRender.
     _hillshadeAdjustZoom: number;
 
+    // PATCH (map2-fork): camera zoom at which ALL draped stacks were last
+    // soft-refreshed for zoom-dependent paint (see below).
+    _zoomRefreshZoom: number;
+
     prepareForRender(style: Style, zoom: number) {
         for (const pool of this.pools) pool.beginFrame();
 
@@ -236,6 +240,33 @@ export class RenderToTexture {
                 for (const id of style._order) {
                     const layer = style._layers[id];
                     if (layer.type === 'hillshade' && layer.source && !seen.has(layer.source)) {
+                        seen.add(layer.source);
+                        this.markSourceChangedSoft(layer.source);
+                    }
+                }
+            }
+        }
+
+        // PATCH (map2-fork): zoom-dependent paint (opacity cross-fades, width/colour
+        // ramps) is constant-folded at the camera zoom of the frame a drape RENDERS in
+        // and baked into the cached texture — nothing re-evaluates it on zoom, so the
+        // style's carefully-tuned fades freeze per tile and only jump when data
+        // invalidation happens to re-bake one (hard pops at tile handover; a patchwork
+        // of neighbours stamped at different zooms). Same shape as the hillshade
+        // refresh above, generalised: once the camera drifts a step from a tile's last
+        // refresh, soft-dirty every draped source — the budget then re-bakes a few
+        // tiles per frame, each stepping ≤ the drift since ITS last refresh. Volatile
+        // stacks refresh per frame anyway; background layers have no source and are
+        // not covered (constant background colours in the gbtracker styles).
+        const driftStep = this.painter.style.map._zoomDriftRefreshStep;
+        if (driftStep > 0) {
+            if (this._zoomRefreshZoom === undefined) this._zoomRefreshZoom = zoom;
+            if (Math.abs(zoom - this._zoomRefreshZoom) > driftStep) {
+                this._zoomRefreshZoom = zoom;
+                const seen = new Set<string>();
+                for (const id of style._order) {
+                    const layer = style._layers[id];
+                    if (LAYERS_TO_TEXTURES[layer.type] && layer.source && !seen.has(layer.source)) {
                         seen.add(layer.source);
                         this.markSourceChangedSoft(layer.source);
                     }

@@ -4292,6 +4292,28 @@ export class Map extends Camera {
     }
 
     /**
+     * map2 fork: zoom drift (in zoom levels) after which every draped stack is
+     * soft-refreshed, so zoom-dependent paint (opacity cross-fades, width/colour
+     * ramps) baked into cached drape textures converges on the current zoom instead
+     * of freezing at each tile's last render. 0 disables. Refreshes are budget-paced
+     * (SOFT_RERENDERS_PER_FRAME), so the per-frame cost is bounded regardless of
+     * how many stacks a drift dirties.
+     */
+    _zoomDriftRefreshStep: number = 0.2;
+
+    /**
+     * map2 fork: set the zoom-drift soft-refresh step for draped stacks (the
+     * `?nozoomrefresh` / `?zoomrefresh=N` A/B in the challenge app). Pass 0 (or
+     * false) to disable — cached drapes then keep their render-time zoom paint
+     * until data invalidation reaches them, as stock does.
+     */
+    setZoomDriftRefresh(step: number | boolean): this {
+        this._zoomDriftRefreshStep = typeof step === 'number' ? Math.max(0, step) : (step ? 0.2 : 0);
+        this.triggerRepaint();
+        return this;
+    }
+
+    /**
      * map2 fork: the mode worker tile parses are dispatched for — layers tagged
      * `map2:visible-when` for the other mode get no buckets built (see setDecodeMode).
      */

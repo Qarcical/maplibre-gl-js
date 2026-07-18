@@ -323,6 +323,23 @@ describe('render to texture', () => {
         }
     });
 
+    test('zoom drift soft-refreshes draped stacks (all sources, not just hillshade)', () => {
+        style._order = ['maine-fill', 'maine-symbol'];
+        (style.tileManagers['maine'].getState as Mock).mockReturnValue({revision: 0});
+        (style.map as any)._zoomDriftRefreshStep = 0.2;
+        try {
+            rtt.prepareForRender(style, 10);        // establishes the drift anchor
+            tile.rtt = [{pool: 0, id: 1, stamp: 123}];
+            tile.rttFingerprint = {maine: '923#0'};
+            rtt.prepareForRender(style, 10.1);      // within the step — untouched
+            expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123});
+            rtt.prepareForRender(style, 10.45);     // drifted past the step — soft dirty
+            expect(tile.rtt[0]).toStrictEqual({pool: 0, id: 1, stamp: 123, dirty: true});
+        } finally {
+            (style.map as any)._zoomDriftRefreshStep = 0;
+        }
+    });
+
     test('markSourceTileChanged invalidates only stacks draping the source', () => {
         style._order = ['maine-fill', 'maine-symbol'];
         (style.tileManagers['maine'].getState as Mock).mockReturnValue({revision: 0});
