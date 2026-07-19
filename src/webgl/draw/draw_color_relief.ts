@@ -86,18 +86,20 @@ function renderColorRelief(
         // PATCH (map2-fork): upload the DEM as a single-channel R32F texture in METRES so the GPU
         // filters linear heights (see color_relief.fragment.glsl). Never pooled — the painter's
         // tile-texture pool is RGBA and recycling a float texture there would corrupt later users.
-        const pixelData = dem.getFloatPixels();
+        // Upload once, not per frame: the scheduler's grant usually created the texture already
+        // (Tile.upload); update only after a backfillBorder mutation (demTextureDirty) — this
+        // draw runs every frame for every covering tile, and the unconditional update() here
+        // used to re-upload every DEM every frame.
         context.activeTexture.set(gl.TEXTURE0);
 
         context.pixelStoreUnpackPremultiplyAlpha.set(false);
-        if (tile.demTexture) {
-            const demTexture = tile.demTexture;
-            demTexture.update(pixelData, {premultiply: false});
-            demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
-        } else {
-            tile.demTexture = new Texture(context, pixelData, (gl as WebGL2RenderingContext).R32F, {premultiply: false});
-            tile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
+        if (!tile.demTexture) {
+            tile.demTexture = new Texture(context, dem.getFloatPixels(), (gl as WebGL2RenderingContext).R32F, {premultiply: false});
+        } else if (tile.demTextureDirty) {
+            tile.demTexture.update(dem.getFloatPixels(), {premultiply: false});
         }
+        tile.demTextureDirty = false;
+        tile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
 
         const mesh = projection.getMeshFromTileID(context, coord.canonical, useBorder, true, 'raster');
 

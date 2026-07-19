@@ -2670,9 +2670,27 @@ describe('TileManager upload spreading', () => {
         const tile = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
 
         scheduler.onFrameStart(16.7);
-        scheduler.noteGranted(1000);
+        // budget spent (normal grants blocked) but within the exempt overdraw window
+        scheduler.noteGranted(scheduler.budgetMs + 0.01);
         tileManager.prepare(context);
         expect((tile as any).buckets.layer.pending).toBe(false);     // blank is worse than burst
+        expect(tile.gatedUpload).toBe(false);
+    });
+
+    test('exemption grants stop once the overdraw bound is hit', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const tile = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        scheduler.onFrameStart(16.7);
+        scheduler.noteGranted(1000);           // way past EXEMPT_OVERDRAW × budget
+        tileManager.prepare(context);
+        expect((tile as any).buckets.layer.pending).toBe(true);      // even exempt defers now
+        expect(tile.gatedUpload).toBe(true);
+        expect(scheduler.deferred).toBe(1);
+
+        scheduler.onFrameStart(16.7);          // fresh frame: exempt path works again
+        scheduler.noteGranted(scheduler.budgetMs + 0.01);
+        tileManager.prepare(context);
         expect(tile.gatedUpload).toBe(false);
     });
 
@@ -2687,14 +2705,15 @@ describe('TileManager upload spreading', () => {
         }
 
         scheduler.onFrameStart(16.7);
-        scheduler.noteGranted(1000);           // budget spent: only exemption slots grant
+        // budget spent: only exemption slots grant (spend within the overdraw window)
+        scheduler.noteGranted(scheduler.budgetMs + 0.01);
         tileManager.prepare(context);
         expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(3);
         expect(scheduler.exemptGranted).toBe(3);
         expect(scheduler.deferred).toBe(5);
 
         scheduler.onFrameStart(16.7);          // slots refresh
-        scheduler.noteGranted(1000);
+        scheduler.noteGranted(scheduler.budgetMs + 0.01);
         tileManager.prepare(context);
         expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(6);
     });
@@ -2710,7 +2729,7 @@ describe('TileManager upload spreading', () => {
         }
 
         scheduler.onFrameStart(16.7);
-        scheduler.noteGranted(1000);
+        scheduler.noteGranted(scheduler.budgetMs + 0.01);
         tileManager.prepare(context);
         // coarse-first order grants the parent on one exemption slot; the children then
         // see a renderable ancestor and defer normally, with exemption slots to spare
@@ -2718,6 +2737,60 @@ describe('TileManager upload spreading', () => {
         expect(children.every((t) => t.gatedUpload)).toBe(true);
         expect(scheduler.exemptGranted).toBe(1);
         expect(scheduler.deferred).toBe(4);
+    });
+
+    test('moving frames tighten the grant count cap', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);   // renderable substitute for all
+        const tiles = [];
+        for (let i = 0; i < 8; i++) {
+            tiles.push(makeTile(new OverscaledTileID(3, 0, 3, i, 0), true));
+        }
+
+        scheduler.onFrameStart(16.7, true);    // moving: cap drops to MOVING_GRANT_COUNT_CAP
+        tileManager.prepare(context);
+        expect(tiles.filter((t) => !t.gatedUpload)).toHaveLength(3);
+        expect(scheduler.deferred).toBe(5);
+
+        scheduler.onFrameStart(16.7, false);   // settled: the full cap applies again
+        tileManager.prepare(context);
+        expect(tiles.filter((t) => !t.gatedUpload).length).toBeGreaterThan(3);
+    });
+
+    test('idle frames pre-upload pinned preloaded tiles; gated in-view tiles win', () => {
+        const {scheduler, tileManager, makeTile, context} = createGatedSetup();
+        const pinTile = (tileID: OverscaledTileID) => {
+            const tile = new Tile(tileID, 512);
+            tile.state = 'loaded';
+            (tile as any).buckets = {layer: fakeBucket()};
+            tile.gatedUpload = true;   // set at load, as _tileLoaded does
+            (tileManager as any)._preloadedTiles[tileID.key] = {tile, staleAfterUpdate: 1e9};
+            return tile;
+        };
+        const pinned = [pinTile(new OverscaledTileID(4, 0, 4, 0, 0)), pinTile(new OverscaledTileID(4, 0, 4, 1, 0))];
+        makeTile(new OverscaledTileID(0, 0, 0, 0, 0), false);       // substitute parent
+        const gated = makeTile(new OverscaledTileID(1, 0, 1, 0, 0), true);
+
+        // frame with a gated in-view tile: pinned tiles wait
+        scheduler.onFrameStart(16.7);
+        tileManager.prepare(context);
+        expect(gated.gatedUpload).toBe(false);
+        expect(pinned.every((t) => (t as any).buckets.layer.pending)).toBe(true);
+
+        // idle frame (nothing gated left): pinned tiles pre-upload under the budget
+        scheduler.onFrameStart(16.7);
+        tileManager.prepare(context);
+        expect(pinned.every((t) => !(t as any).buckets.layer.pending)).toBe(true);
+        expect(pinned.every((t) => !t.gatedUpload)).toBe(true);
+        expect(scheduler.granted).toBe(2);
+
+        // a held RTT invalidation keeps a pinned tile on the grant-at-promotion path
+        const held = pinTile(new OverscaledTileID(4, 0, 4, 2, 0));
+        held.heldRttInvalidation = true;
+        scheduler.onFrameStart(16.7);
+        tileManager.prepare(context);
+        expect((held as any).buckets.layer.pending).toBe(true);
+        expect(held.gatedUpload).toBe(true);
     });
 
     test('grant count cap bounds a backlog even with time budget remaining', () => {

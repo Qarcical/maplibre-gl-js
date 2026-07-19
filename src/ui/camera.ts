@@ -300,6 +300,12 @@ export abstract class Camera extends Evented {
     _pitching: boolean;
     _rolling: boolean;
     _padding: boolean;
+    // PATCH (map2-fork): timestamp of the last jumpTo. Scripted per-frame camera drives
+    // (the challenge animations' eases) move the camera by jumpTo, which fires
+    // movestart/moveend synchronously INSIDE each call — so isMoving() is false by the
+    // time the render loop runs, and motion-gated pacing (the upload scheduler's moving
+    // grant cap / backlog scale-up suppression) never saw those frames as motion.
+    _lastJumpToTs = 0;
 
     _bearingSnap: number;
     _zoomSnap: number;
@@ -985,6 +991,7 @@ export abstract class Camera extends Evented {
      */
     jumpTo(options: JumpToOptions, eventData?: any): this {
         this.stop();
+        this._lastJumpToTs = performance.now();   // PATCH (map2-fork): see field doc
 
         if ('zoom' in options && this._zoomSnap) {
             options.zoom = evaluateZoomSnap(options.zoom, this._zoomSnap);

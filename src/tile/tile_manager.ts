@@ -252,6 +252,41 @@ export class TileManager extends Evented {
         }
         if (gated) {
             this._uploadGatedTiles(gated, context);
+        } else {
+            this._uploadPreloadedTiles(context);
+        }
+    }
+
+    /**
+     * PATCH (map2-fork): background pre-upload of pinned preloaded tiles under the
+     * scheduler's per-frame budget, run only on frames where this source has no gated
+     * IN-VIEW tiles waiting (in-view always wins). preloadTiles prepays fetch +
+     * worker-parse, but every GPU integration used to wait for promotion — so a goal
+     * zoom window's entry ease still integrated the whole close-up ladder mid-tween
+     * (field capture 2026-07-19 07:22: 10–13ms CPU / 30ms GPU frames mid-ease while
+     * the seconds between prefetch and entry sat at 0 grants). Uploading the pinned
+     * tiles during that idle window makes promotion genuinely free. Tiles with a held
+     * RTT invalidation (terrain active) keep the normal grant-at-promotion path — the
+     * drape invalidation must fire when the tile becomes renderable, not before.
+     */
+    _uploadPreloadedTiles(context: Context) {
+        const scheduler = this.map?.painter?.uploadScheduler;
+        if (!scheduler?.enabled) {
+            return;
+        }
+        for (const key in this._preloadedTiles) {
+            if (!scheduler.hasGrantCapacity()) {
+                return;
+            }
+            const {tile} = this._preloadedTiles[key];
+            if (tile.state !== 'loaded' || tile.heldRttInvalidation || !tile.hasPendingUploads()) {
+                continue;
+            }
+            const start = performance.now();
+            tile.upload(context);
+            tile.prepare(this.map.style.imageManager);
+            scheduler.noteGranted(performance.now() - start);
+            tile.gatedUpload = false;
         }
     }
 

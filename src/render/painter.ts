@@ -139,6 +139,12 @@ export class Painter {
     // TileManager.prepare gates freshly-arrived tiles through it
     uploadScheduler: UploadScheduler;
     /**
+     * PATCH (map2-fork): fresh hillshade prepares (fbo alloc + prepare draw) run this
+     * frame — capped per frame in 2D (see prepareHillshade) so a promoted DEM ladder
+     * doesn't integrate its whole offscreen pass in one frame.
+     */
+    demPreparesThisFrame = 0;
+    /**
      * map2 fork: the mode `map2:visible-when`-tagged layers are checked against — layers
      * tagged for the other mode are skipped by the render loops and the RTT stack
      * machinery (no draws, no stack content, no pool demand, and live splitters stop
@@ -571,6 +577,8 @@ export class Painter {
         // map2 fork: refresh which sources bypass the upload budget (per-frame anim
         // overlays) before the prepare loop asks for grants
         this.uploadScheduler.updateVolatileSources(style);
+        // map2 fork: per-frame budget for fresh hillshade prepares (see draw_hillshade)
+        this.demPreparesThisFrame = 0;
 
         for (const id in tileManagers) {
             const tileManager = tileManagers[id];

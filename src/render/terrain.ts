@@ -290,9 +290,15 @@ export class Terrain {
             const context = this.painter.context;
             const uploadStart = performance.now();
             // PATCH (map2-fork): R32F metres, shared tile.demTexture with hillshade/color-relief.
-            // Never pooled (the painter's tile-texture pool is RGBA-only).
-            if (sourceTile.demTexture) sourceTile.demTexture.update(sourceTile.dem.getFloatPixels(), {premultiply: false});
-            else sourceTile.demTexture = new Texture(context, sourceTile.dem.getFloatPixels(), (context.gl as WebGL2RenderingContext).R32F, {premultiply: false});
+            // Never pooled (the painter's tile-texture pool is RGBA-only). A texture the
+            // scheduler's grant already created (Tile.upload) is current unless a
+            // backfillBorder mutated the dem since (demTextureDirty).
+            if (!sourceTile.demTexture) {
+                sourceTile.demTexture = new Texture(context, sourceTile.dem.getFloatPixels(), (context.gl as WebGL2RenderingContext).R32F, {premultiply: false});
+            } else if (sourceTile.demTextureDirty) {
+                sourceTile.demTexture.update(sourceTile.dem.getFloatPixels(), {premultiply: false});
+            }
+            sourceTile.demTextureDirty = false;
             sourceTile.demTexture.bind(context.gl.NEAREST, context.gl.CLAMP_TO_EDGE);
             sourceTile.needsTerrainPrepare = false;
             // a 16MB DEM upload spends the same main-thread time the upload scheduler

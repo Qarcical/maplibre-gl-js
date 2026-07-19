@@ -3971,10 +3971,16 @@ export class Map extends Camera {
                     this._lastRenderTimestamp = paintStartTimeStamp;
                     const cpuStart = performance.now();
                     // budget the frame's gated tile uploads from the period the frame
-                    // actually has (governor cap, else the vsync estimate); isMoving
-                    // suppresses the backlog scale-up (detail latency is invisible
-                    // mid-motion, the scaled budget's spikes are not)
-                    this.painter.uploadScheduler.onFrameStart(this._effectiveFramePeriod(), this.isMoving());
+                    // actually has (governor cap, else the vsync estimate); moving
+                    // suppresses the backlog scale-up and tightens the grant count cap
+                    // (detail latency is invisible mid-motion, the spikes are not).
+                    // isMoving() alone misses scripted per-frame jumpTo drives (the
+                    // challenge animations' eases fire movestart/moveend synchronously
+                    // inside each call) — field capture 2026-07-19: the backlog
+                    // scale-up re-engaged mid-ease and re-admitted 13ms upload frames.
+                    // A jumpTo in the last 150ms counts as motion.
+                    const scriptedMove = performance.now() - this._lastJumpToTs < 150;
+                    this.painter.uploadScheduler.onFrameStart(this._effectiveFramePeriod(), this.isMoving() || scriptedMove);
                     try {
                         this._render(paintStartTimeStamp);
                     } catch(error) {
@@ -4537,6 +4543,17 @@ export class Map extends Camera {
      * mode on this so older bundles fall back to the legacy slicer.
      */
     readonly supportsLineProgressSpans = true;
+
+    /**
+     * map2 fork capability flag: the dash+gradient line program (line-dasharray AND
+     * line-gradient on one layer) carries the progress clip too, and lineMetrics
+     * buckets pack the TRUE tile-unit dash distance (stock crammed the dash pattern
+     * by the feature's length). Together these let a covered/uncovered split render
+     * as two layers over ONE static lineMetrics source — solid + dashed — with the
+     * split carried by complementary step-expression line-gradients and the grow by
+     * the shared clip uniform. Apps gate the split-gradient trim mode on this.
+     */
+    readonly supportsGradientDashProgressClip = true;
 
     setLineProgressClip(layerId: string, progress: number | null): this {
         const layer = this.style?.getLayer(layerId) as {lineProgressClip?: number | null; source?: string};

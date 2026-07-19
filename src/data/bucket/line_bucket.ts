@@ -98,6 +98,13 @@ export class LineBucket implements Bucket {
     maxLineLength: number;
     scaledDistance: number;
     lineClips?: LineClips;
+    // PATCH (map2-fork): rebase offset for the TRUE tile-unit dash distance written to
+    // a_data on lineMetrics buckets (see addHalfVertex) — stock packed the normalized
+    // whole-feature progress there instead, which scaled every dash/pattern by the
+    // feature's length (a 90 km track crammed the dash texture ~thousands of times too
+    // dense). The offset resets like stock's non-metrics `distance` reset, because the
+    // packed field only holds ~2^13 tile units.
+    dashDistanceOffset: number;
 
     e1: number;
     e2: number;
@@ -299,6 +306,7 @@ export class LineBucket implements Bucket {
         this.distance = 0;
         this.scaledDistance = 0;
         this.totalDistance = 0;
+        this.dashDistanceOffset = 0;
 
         // First, subdivide the line if needed (mostly for globe rendering)
         const granularity = canonical ? subdivisionGranularity.line.getGranularityForZoomLevel(canonical.z) : 1;
@@ -584,11 +592,22 @@ export class LineBucket implements Bucket {
             this.distance = 0;
             this.updateScaledDistance();
             this.addCurrentVertex(p, normal, endLeft, endRight, segment, round);
+        } else if (this.lineClips && this.distance - this.dashDistanceOffset > MAX_LINE_DISTANCE / 2) {
+            // PATCH (map2-fork): same overflow reset for the lineMetrics dash distance —
+            // `distance` itself must keep accumulating (scaledDistance derives from it),
+            // so rebase the packed value via an offset instead of zeroing it.
+            this.dashDistanceOffset = this.distance;
+            this.addCurrentVertex(p, normal, endLeft, endRight, segment, round);
         }
     }
 
     addHalfVertex({x, y}: Point, extrudeX: number, extrudeY: number, round: boolean, up: boolean, dir: number, segment: Segment) {
-        const totalDistance = this.lineClips ? this.scaledDistance * (MAX_LINE_DISTANCE - 1) : this.scaledDistance;
+        // PATCH (map2-fork): lineMetrics buckets pack the TRUE tile-unit distance for the
+        // dash/pattern phase, not the normalized whole-feature progress stock put here —
+        // stock scaled every dash by the feature's length ("crammed" dashes on lineMetrics
+        // sources; it is why the challenge styles needed a separate plain source for their
+        // dashed layers). Whole-feature progress lives in the ext buffer (a_global_progress).
+        const totalDistance = this.lineClips ? this.distance - this.dashDistanceOffset : this.scaledDistance;
         // scale down so that we can store longer distances while sacrificing precision.
         const linesofarScaled = totalDistance * LINE_DISTANCE_SCALE;
 

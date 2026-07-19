@@ -66,6 +66,7 @@ export type LineGradientSDFUniformsType = {
     'u_mix': Uniform1f;
     'u_lineatlas_width': Uniform1f;
     'u_lineatlas_height': Uniform1f;
+    'u_progress_clip': Uniform1f;
 };
 
 const lineUniforms = (context: Context, locations: UniformLocations): LineUniformsType => ({
@@ -123,7 +124,8 @@ const lineGradientSDFUniforms = (context: Context, locations: UniformLocations):
     'u_image_dash': new Uniform1i(context, locations.u_image_dash),
     'u_mix': new Uniform1f(context, locations.u_mix),
     'u_lineatlas_width': new Uniform1f(context, locations.u_lineatlas_width),
-    'u_lineatlas_height': new Uniform1f(context, locations.u_lineatlas_height)
+    'u_lineatlas_height': new Uniform1f(context, locations.u_lineatlas_height),
+    'u_progress_clip': new Uniform1f(context, locations.u_progress_clip)
 });
 
 const lineUniformValues = (
@@ -228,6 +230,9 @@ const lineGradientSDFUniformValues = (
         'u_mix': crossfade.t,
         'u_lineatlas_width': painter.lineAtlas.width,
         'u_lineatlas_height': painter.lineAtlas.height,
+        // clip rendering to the leading fraction of each feature (2 = disabled) —
+        // see Map.setLineProgressClip
+        'u_progress_clip': layer.lineProgressClip ?? 2,
     });
 };
 

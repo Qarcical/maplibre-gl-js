@@ -90,6 +90,8 @@ export class UploadScheduler {
     uploadMs = 0;
 
     private _framePeriodMs = 1000 / 60;
+    /** camera moving this frame (onFrameStart) — tightens the grant count cap */
+    private _isMoving = false;
     /** EMA of the frame's non-upload main-thread cost; <0 = no sample yet */
     private _emaBaseCpuMs = -1;
     /** EMA of a single tile's measured upload cost (diagnostics/drain estimates) */
@@ -103,6 +105,23 @@ export class UploadScheduler {
     private static readonly BUDGET_CAP_MS = 16.0;
     /** backlogs beyond this many tiles scale the budget up so big flyTo bursts drain fast */
     private static readonly BACKLOG_SCALE_START = 16;
+    /**
+     * grant count cap while the camera is MOVING (goal-window eases, flyTo): detail
+     * latency is invisible under motion (coarse substitutes draw) and motion frames
+     * have the least headroom — field capture 2026-07-19 (Leamington window entry)
+     * showed 12–22 grants / 42MB buffers / 13.1ms measured in single ease frames
+     * (30ms GPU max) even with the per-tile greedy budget, because a dense z13 tile
+     * measures only AFTER it uploads. A 2s ease at 120fps has ~240 frames; 3/frame
+     * drains a 50-tile promotion in under a fifth of the ease.
+     */
+    private static readonly MOVING_GRANT_COUNT_CAP = 3;
+    /**
+     * exemption (no-substitute) grants are allowed to overdraw the time budget — blank
+     * is worse than burst — but only up to this multiple of it. Unbounded exempt time
+     * was the other half of the 13.1ms-in-one-frame capture above (3 exempt grants of
+     * dense close-up tiles landed after the budget was already spent).
+     */
+    private static readonly EXEMPT_OVERDRAW = 2.0;
     /**
      * enough for the coarse skeleton of a viewport (one zoom ring is ~6–12 tiles
      * across all sources) without re-admitting the synchronized-promotion burst
@@ -125,6 +144,7 @@ export class UploadScheduler {
      */
     onFrameStart(framePeriodMs: number, isMoving: boolean = false) {
         if (framePeriodMs > 0) this._framePeriodMs = framePeriodMs;
+        this._isMoving = isMoving;
         const backlog = this.deferred;
         this.granted = 0;
         this.exemptGranted = 0;
@@ -164,7 +184,13 @@ export class UploadScheduler {
         if (!this.hasBudget()) {
             return false;
         }
-        return this.grantCountCap <= 0 || this.granted < this.grantCountCap;
+        if (this.grantCountCap <= 0) {
+            return true;
+        }
+        const cap = this._isMoving
+            ? Math.min(this.grantCountCap, UploadScheduler.MOVING_GRANT_COUNT_CAP)
+            : this.grantCountCap;
+        return this.granted < cap;
     }
 
     /**
@@ -172,9 +198,17 @@ export class UploadScheduler {
      * on why the exemption class must be bounded). Returns false once the cap is
      * reached — the caller defers the tile; next frame the slots refresh and the
      * tiles granted this frame have become renderable substitutes for the rest.
+     * Exempt grants may overdraw the time budget (blank is worse than burst) but
+     * only up to EXEMPT_OVERDRAW × budget — past that the frame is already heavy
+     * and one more frame of coarse substitute beats deepening the spike.
      */
     tryExemptGrant(): boolean {
-        if (this.exemptGrantCap > 0 && this.exemptGranted >= this.exemptGrantCap) {
+        if (this.exemptGrantCap <= 0) {   // cap disabled — fully unbounded (stock-ish)
+            this.exemptGranted++;
+            return true;
+        }
+        if (this.exemptGranted >= this.exemptGrantCap ||
+            this._spentMs >= this._budgetMs * UploadScheduler.EXEMPT_OVERDRAW) {
             return false;
         }
         this.exemptGranted++;

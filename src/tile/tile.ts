@@ -111,6 +111,11 @@ export class Tile {
     texture: any;
     fbo: Framebuffer;
     demTexture: Texture;
+    // PATCH (map2-fork): dem mutated (backfillBorder) since demTexture last uploaded.
+    // Consumers (hillshade prepare, color-relief, terrain) re-upload only when set —
+    // color-relief used to re-upload every tile's DEM every frame — and upload() can
+    // pre-create the texture under the upload scheduler's measured grant.
+    demTextureDirty: boolean = false;
     refreshedUponExpiration: boolean;
     reloadPromise: {resolve: () => void; reject: () => void};
     resourceTiming: PerformanceResourceTiming[];
@@ -223,7 +228,12 @@ export class Tile {
     }
 
     clearTextures(painter: any) {
-        if (this.demTexture) painter.saveTileTexture(this.demTexture);
+        // PATCH (map2-fork): destroy, don't pool — demTexture is R32F and the painter's
+        // tile-texture pool is RGBA-only, keyed by size; recycling a float texture there
+        // would corrupt a later RGBA user (see draw_color_relief.ts). The `painter`
+        // parameter stays for call-site compatibility.
+        void painter;
+        if (this.demTexture) this.demTexture.destroy();
         this.demTexture = null;
     }
 
@@ -362,6 +372,20 @@ export class Tile {
             this.glyphAtlasTexture = new Texture(context, this.glyphAtlasImage, gl.ALPHA);
             this.glyphAtlasImage = null;
         }
+
+        // PATCH (map2-fork): create a raster-dem tile's R32F texture here, inside the
+        // upload scheduler's measured grant, instead of at first draw. The float
+        // conversion + ~1MB texImage per tile used to run outside any budget, so a
+        // close-up viewport's synchronized DEM ladder arrival (goal-zoom window entry,
+        // 3D fly arrival) integrated every tile in one frame. The draw paths find the
+        // texture ready and only re-upload after a backfillBorder mutation
+        // (demTextureDirty). Never pooled — the painter's tile-texture pool is RGBA.
+        if (this.dem && !this.demTexture) {
+            context.pixelStoreUnpackPremultiplyAlpha.set(false);
+            this.demTexture = new Texture(context, this.dem.getFloatPixels(),
+                (gl as WebGL2RenderingContext).R32F, {premultiply: false});
+            this.demTextureDirty = false;
+        }
     }
 
     prepare(imageManager: ImageManager) {
@@ -444,11 +468,15 @@ export class Tile {
         return this.hasData() && !this.gatedUpload;
     }
 
-    /** PATCH (map2-fork): any GPU upload work outstanding (buckets or atlas textures)? */
+    /** PATCH (map2-fork): any GPU upload work outstanding (buckets, atlas textures, or
+     * a raster-dem tile's R32F texture)? The dem clause is what lets the upload
+     * scheduler gate fresh DEM tiles — without it a window-entry / fly-arrival DEM
+     * ladder paid every float-convert + upload in a single frame at first draw. */
     hasPendingUploads(): boolean {
         for (const id in this.buckets) {
             if (this.buckets[id].uploadPending()) return true;
         }
+        if (this.dem && !this.demTexture) return true;
         return !!((this.imageAtlas && !this.imageAtlas.uploaded) || this.glyphAtlasImage);
     }
 

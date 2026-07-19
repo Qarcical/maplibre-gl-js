@@ -106,6 +106,16 @@ function prepareHillshade(
 
     const textureFilter = layer.paint.get('resampling') === 'nearest' ?  gl.NEAREST : gl.LINEAR;
 
+    // PATCH (map2-fork): cap fresh prepares per frame in 2D — a promoted close-up DEM
+    // ladder (goal-zoom window entry) used to allocate every tile's fbo and run every
+    // prepare draw in one frame, ungated and unmeasured (~1MB RGBA fbo per tile).
+    // A deferred tile draws nothing for a frame or two (renderHillshade skips fbo-less
+    // tiles), which reads as the shading fading in tile-by-tile — invisible next to
+    // the frame spike it replaces. 3D keeps the uncapped path: RTT drapes cache what
+    // they rendered, and a drape baked while a tile had no fbo would keep the hole.
+    const prepareCap = painter.style.map.terrain ? Infinity : 4;
+    let prepareDeferred = false;
+
     for (const coord of tileIDs) {
         const tile = tileManager.getTile(coord);
         const dem = tile.dem;
@@ -118,24 +128,29 @@ function prepareHillshade(
             continue;
         }
 
+        if (painter.demPreparesThisFrame >= prepareCap) {
+            prepareDeferred = true;
+            continue;
+        }
+        painter.demPreparesThisFrame++;
+
         const tileSize = dem.dim;
-        const textureStride = dem.stride;
 
         // PATCH (map2-fork): the DEM uploads as R32F metres (shared tile.demTexture with
         // color-relief; see draw_color_relief.ts). NEAREST as before — the prepare pass taps
-        // exact texel centres. Never pooled (the pool is RGBA-only).
-        const pixelData = dem.getFloatPixels();
+        // exact texel centres. Never pooled (the pool is RGBA-only). The upload scheduler's
+        // grant usually created the texture already (Tile.upload); re-upload only after a
+        // backfillBorder mutation (demTextureDirty).
         context.activeTexture.set(gl.TEXTURE1);
 
         context.pixelStoreUnpackPremultiplyAlpha.set(false);
-        if (tile.demTexture) {
-            const demTexture = tile.demTexture;
-            demTexture.update(pixelData, {premultiply: false});
-            demTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
-        } else {
-            tile.demTexture = new Texture(context, pixelData, (gl as WebGL2RenderingContext).R32F, {premultiply: false});
-            tile.demTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
+        if (!tile.demTexture) {
+            tile.demTexture = new Texture(context, dem.getFloatPixels(), (gl as WebGL2RenderingContext).R32F, {premultiply: false});
+        } else if (tile.demTextureDirty) {
+            tile.demTexture.update(dem.getFloatPixels(), {premultiply: false});
         }
+        tile.demTextureDirty = false;
+        tile.demTexture.bind(gl.NEAREST, gl.CLAMP_TO_EDGE);
 
         context.activeTexture.set(gl.TEXTURE0);
 
@@ -162,5 +177,11 @@ function prepareHillshade(
             painter.quadTriangleIndexBuffer, painter.rasterBoundsSegments);
 
         tile.needsHillshadePrepare = false;
+    }
+
+    if (prepareDeferred) {
+        // finish the deferred prepares on subsequent frames even if nothing else is
+        // animating (a static camera after a plain pan would otherwise hold the hole)
+        painter.style.map.triggerRepaint();
     }
 }
