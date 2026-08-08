@@ -4046,10 +4046,35 @@ describe('flight path preload coarse clamp', () => {
         camera.jumpTo({center: [0, 0], zoom: 14});
         const samples = samplesForLongFlight(camera);
         expect(samples.length).toBeGreaterThan(2);
-        expect(samples[samples.length - 1].zoom).toBeCloseTo(14, 1);
+        expect(samples[samples.length - 1].tr.zoom).toBeCloseTo(14, 1);
         for (let i = 0; i < samples.length - 1; i++) {
-            expect(samples[i].zoom).toBeLessThanOrEqual(14 - 2.5 + 1e-9);
+            expect(samples[i].tr.zoom).toBeLessThanOrEqual(14 - 2.5 + 1e-9);
         }
+    });
+
+    test('clamped samples carry their pre-clamp clone for raster-dem; the destination does not', () => {
+        const camera = createCamera();
+        camera.jumpTo({center: [0, 0], zoom: 14});
+        const samples = samplesForLongFlight(camera);
+        expect(samples[samples.length - 1].fullZoomTr).toBeUndefined();
+        const clamped = samples.slice(0, -1).filter((s) => s.fullZoomTr);
+        expect(clamped.length).toBeGreaterThan(0);
+        for (const s of clamped) {
+            expect(s.fullZoomTr.zoom).toBeGreaterThan(s.tr.zoom);
+            expect(s.fullZoomTr.center.lng).toBeCloseTo(s.tr.center.lng, 9);
+            expect(s.fullZoomTr.center.lat).toBeCloseTo(s.tr.center.lat, 9);
+        }
+    });
+
+    test('pan-dominated flights get midpoint samples (no gap wider than 1/8 of the flight)', () => {
+        // Same start/end zoom over a modest distance: few integer-zoom crossings, so
+        // without densification the path would be 2-3 samples with wide center gaps.
+        const camera = createCamera();
+        camera.jumpTo({center: [0, 0], zoom: 12});
+        const prep = (camera as any)._prepareFlight({center: [0.7, 0], zoom: 12}, camera.transform.clone());
+        expect(prep).toBeTruthy();
+        const samples = (camera as any)._sampleFlightPath(prep);
+        expect(samples.length).toBeGreaterThanOrEqual(8);
     });
 
     test('setPathPreloadCoarseDrop(0) disables the clamp (fine rings sample at full zoom)', () => {
@@ -4057,7 +4082,8 @@ describe('flight path preload coarse clamp', () => {
         camera.jumpTo({center: [0, 0], zoom: 14});
         camera.setPathPreloadCoarseDrop(0);
         const samples = samplesForLongFlight(camera);
-        const midMax = Math.max(...samples.slice(0, -1).map((t) => t.zoom));
+        const midMax = Math.max(...samples.slice(0, -1).map((s) => s.tr.zoom));
         expect(midMax).toBeGreaterThan(14 - 2.5);
+        expect(samples.every((s) => s.fullZoomTr === undefined)).toBe(true);
     });
 });

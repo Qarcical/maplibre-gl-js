@@ -2613,9 +2613,11 @@ export class Map extends Camera {
     // PATCH (map2-fork): Camera's no-op stub overridden with the real fan-out — preload every
     // source's tiles for the given future transform. Also reached by flyTo's `preloadTiles`
     // option, which samples its flight path and preloads each sampled viewport through this.
-    override _preloadTransform(tr: ITransform): Promise<void> {
+    // `fullZoomTr` (pre-clamp clone of a coarse-clamped flight sample) is offered to every
+    // manager; only raster-dem managers use it — see TileManager.preloadTiles.
+    override _preloadTransform(tr: ITransform, fullZoomTr?: ITransform): Promise<void> {
         const managers = Object.values(this.style?.tileManagers ?? {});
-        return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr))).then(() => {});
+        return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr, fullZoomTr))).then(() => {});
     }
 
     // PATCH (map2-fork): unpin all preloaded-but-unused tiles across every source (loaded ones

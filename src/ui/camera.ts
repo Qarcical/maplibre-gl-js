@@ -288,6 +288,15 @@ type FlightPrep = {
     pointAtOffset: Point;
 };
 
+// PATCH (map2-fork): one sampled flight-path viewport to preload. `tr` is the sample the
+// vector/raster sources use (mid-path samples may be zoom-clamped coarse — see
+// _sampleFlightPath); `fullZoomTr`, present only when the clamp bit, is the pre-clamp
+// clone that raster-dem sources preload from instead (TileManager.preloadTiles).
+export type FlightPreloadSample = {
+    tr: ITransform;
+    fullZoomTr?: ITransform;
+};
+
 export abstract class Camera extends Evented {
     transform: ITransform;
     cameraHelper: ICameraHelper;
@@ -1537,8 +1546,8 @@ export abstract class Camera extends Evented {
         // first frame renders (see _sampleFlightPath). preloadFlight offers the same ahead of the
         // flyTo call itself; tiles already pinned there dedupe here, so both together are cheap.
         if (options.preloadTiles) {
-            for (const trSample of this._sampleFlightPath(prep)) {
-                this._preloadTransform(trSample).catch(() => {});
+            for (const sample of this._sampleFlightPath(prep)) {
+                this._preloadTransform(sample.tr, sample.fullZoomTr).catch(() => {});
             }
         }
 
@@ -1708,7 +1717,7 @@ export abstract class Camera extends Evented {
     // projection's own easeFunc — onto CLONES of the start transform at a few sample points
     // (the zoomed-out apex and the descent), so the live transform is untouched. Used by flyTo's
     // preloadTiles option and by preloadFlight.
-    _sampleFlightPath(prep: FlightPrep): ITransform[] {
+    _sampleFlightPath(prep: FlightPrep): FlightPreloadSample[] {
         // Sample at every INTEGER display-zoom crossing along the flight, plus the destination.
         // Fixed fractional samples miss most tile-zoom rings on a long flight — a z17→z9 flight
         // (via a ~z7 apex) crosses ~13 rings, and 4 fractional samples touch only ~4 of them, so
@@ -1717,17 +1726,41 @@ export abstract class Camera extends Evented {
         // the integer part of the display zoom changes. Capped for pathological spans.
         const startZoom = prep.tr.zoom;
         const ks: number[] = [];
-        let prevZ = Math.floor(startZoom);
+        // Emit at every HALF-integer display-zoom crossing, not just integer ones: vector
+        // rings swap at integer zooms, but raster/raster-dem sources ROUND their covering
+        // zoom, flipping rings at .5 boundaries. A flight landing at z13.52 never crosses
+        // integer 14, so integer-only sampling has no viewport at the moment the dem ring
+        // flips to 14 mid-pan — the swept ring-14 tiles between the flip point and arrival
+        // loaded reactively, and hillshade popped them in with no fade (2026-08-07 field
+        // traces + headless tile-id capture: z14 dem loads at mapZoom 13.52).
+        let prevHalfZ = Math.floor(startZoom * 2);
         const SCAN_STEPS = 96;
         for (let i = 1; i < SCAN_STEPS && ks.length < 24; i++) {
             const k = i / SCAN_STEPS;
-            const z = Math.floor(startZoom + scaleZoom(1 / prep.w(k * prep.S)));
-            if (z !== prevZ) {
+            const halfZ = Math.floor((startZoom + scaleZoom(1 / prep.w(k * prep.S))) * 2);
+            if (halfZ !== prevHalfZ) {
                 ks.push(k);
-                prevZ = z;
+                prevHalfZ = halfZ;
             }
         }
         ks.push(1);
+
+        // PATCH (map2-fork): a pan-dominated flight (a shallow between-tracks fold) crosses
+        // few integer-zoom rings, so the crossing samples above leave CENTER gaps — the camera
+        // travels several viewport-widths within one ring, and the tiles in between are in no
+        // sample's cover, so they load reactively mid-flight. Vector hides that behind pinned
+        // parents; hillshade pops the late DEM tiles in with no fade (2026-08-07 field traces:
+        // tile-shaped shading holes zooming into a track). Insert midpoint samples until no two
+        // neighbours are more than MAX_K_GAP of the flight apart; overlapping covers dedupe
+        // against existing pins in preloadTiles, so dense sampling is cheap.
+        const MAX_K_GAP = 1 / 16;
+        for (let i = 0; i < ks.length && ks.length < 32; i++) {
+            const prev = i === 0 ? 0 : ks[i - 1];
+            if (ks[i] - prev > MAX_K_GAP) {
+                ks.splice(i, 0, prev + (ks[i] - prev) / 2);
+                i--;   // re-check the narrowed gap
+            }
+        }
 
         const samples: ITransform[] = [];
         for (const k of ks) {
@@ -1769,16 +1802,20 @@ export abstract class Camera extends Evented {
         // they're the drape substitutes retention wants) and drops only the transient
         // fine rings; mid-flight then renders coarse from the pinned parents — the
         // same thing the (field-proven smooth) no-prefetch behaviour shows.
+        // Each clamped sample keeps its pre-clamp clone (fullZoomTr): raster-dem
+        // sources preload from THAT — see TileManager.preloadTiles for why.
+        const out: FlightPreloadSample[] = samples.map((tr) => ({tr}));
         if (this._pathPreloadCoarseDrop > 0 && samples.length > 1) {
             const destZoom = samples[samples.length - 1].zoom;
             for (let i = 0; i < samples.length - 1; i++) {
                 const clamped = Math.min(samples[i].zoom, destZoom - this._pathPreloadCoarseDrop);
                 if (clamped < samples[i].zoom) {
+                    out[i].fullZoomTr = samples[i].clone();
                     samples[i].setZoom(clamped);
                 }
             }
         }
-        return samples;
+        return out;
     }
 
     /**
@@ -1811,7 +1848,7 @@ export abstract class Camera extends Evented {
         if (!prep) {
             return this.preloadCamera(pick(options, ['center', 'zoom', 'bearing', 'pitch', 'roll', 'elevation', 'padding']) as JumpToOptions);
         }
-        return Promise.allSettled(this._sampleFlightPath(prep).map((trSample) => this._preloadTransform(trSample))).then(() => {});
+        return Promise.allSettled(this._sampleFlightPath(prep).map((sample) => this._preloadTransform(sample.tr, sample.fullZoomTr))).then(() => {});
     }
 
     // PATCH (map2-fork): preload every source's tiles for a FUTURE camera position, so a scripted
@@ -1850,7 +1887,8 @@ export abstract class Camera extends Evented {
     // PATCH (map2-fork): preload the tiles covering a future transform. Camera has no access to
     // the style's sources, so this is a no-op here; Map overrides it with the real fan-out. flyTo
     // uses it to prefetch its sampled flight path when `preloadTiles: true` is passed.
-    _preloadTransform(_tr: ITransform): Promise<void> {
+    // `fullZoomTr` is the pre-clamp clone of a coarse-clamped flight sample (FlightPreloadSample).
+    _preloadTransform(_tr: ITransform, _fullZoomTr?: ITransform): Promise<void> {
         return Promise.resolve();
     }
 

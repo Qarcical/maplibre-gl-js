@@ -765,8 +765,19 @@ export class TileManager extends Evented {
     // upload remains, on first render). Resolves when every newly requested tile settles
     // (loaded or errored). Tiles already in view, already pinned, or already cached are reused.
     // Not supported for image sources or terrain-ancestor expansion (unused by our exports).
-    async preloadTiles(transform: ITransform): Promise<void> {
+    async preloadTiles(transform: ITransform, fullZoomTransform?: ITransform): Promise<void> {
         const debug = this.map?._preloadDebug;
+        // PATCH (map2-fork): raster-dem ignores the flight sampler's mid-path coarse clamp and
+        // preloads at the full ring zoom (fullZoomTransform is the pre-clamp sample clone). A
+        // vector tile missing mid-flight renders seamlessly from its pinned coarse parent, but
+        // hillshade can't draw a freshly loaded DEM tile until its neighbours are backfilled, so
+        // a reactive DEM load shows as a tile-shaped hole in the shading for several frames —
+        // field traces 2026-08-07 (Mac, wainwrights folds: DEM range-fetch bursts at each
+        // flicker). DEM rings are also far cheaper than the vector rings the clamp exists for
+        // (Terrarium WebP tiles, no worker parse backlog), so full-zoom pins are affordable.
+        if (fullZoomTransform && this._source.type === 'raster-dem') {
+            transform = fullZoomTransform;
+        }
         if (!this._sourceLoaded || this._paused) {
             if (debug) console.log(`[map2-fork] preload '${this.id}' skipped: ${this._paused ? 'paused' : 'source not loaded'}`);
             return;
@@ -789,6 +800,35 @@ export class TileManager extends Evented {
             terrain: this.terrain,
             calculateTileZoom: this._source.calculateTileZoom,
         });
+        // PATCH (map2-fork): raster-dem preloads take a one-tile margin around the cover. The
+        // preload aims at a PREDICTED camera (stepCamera during the date tween, flight samples
+        // at scan resolution), and the live camera lands within a fraction of a tile of it —
+        // enough to want one extra row/column the prediction missed (headless tile-id capture
+        // 2026-08-07: a single 6-tile z14 row loading reactively on arrival). Vector doesn't
+        // need it (parents substitute invisibly); DEM tiles are small and the margin dedupes
+        // against existing pins, so it's cheap insurance against every sub-tile aim error.
+        if (this._source.type === 'raster-dem' && idealTileIDs.length > 0) {
+            const seen = new Set(idealTileIDs.map((id) => id.key));
+            const margin: OverscaledTileID[] = [];
+            for (const id of idealTileIDs) {
+                const zMax = 1 << id.canonical.z;
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        const x = id.canonical.x + dx;
+                        const y = id.canonical.y + dy;
+                        if ((dx === 0 && dy === 0) || x < 0 || y < 0 || x >= zMax || y >= zMax) {
+                            continue;
+                        }
+                        const n = new OverscaledTileID(id.overscaledZ, id.wrap, id.canonical.z, x, y);
+                        if (!seen.has(n.key)) {
+                            seen.add(n.key);
+                            margin.push(n);
+                        }
+                    }
+                }
+            }
+            idealTileIDs = idealTileIDs.concat(margin);
+        }
         if (this._source.hasTile) {
             idealTileIDs = idealTileIDs.filter((coord) => this._source.hasTile(coord));
         }
