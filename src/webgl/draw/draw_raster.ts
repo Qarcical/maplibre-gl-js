@@ -1,13 +1,10 @@
-import {clamp} from '../../util/util';
-
 import {ImageSource} from '../../source/image_source';
-import {now} from '../../util/time_control';
 import {StencilMode} from '../stencil_mode';
 import {DepthMode} from '../depth_mode';
 import {CullFaceMode} from '../cull_face_mode';
 import {rasterUniformValues} from '../program/raster_program';
 import {EXTENT} from '../../data/extent';
-import {FadingDirections} from '../../tile/tile';
+import {getFadeProperties} from './raster_fade_values';
 import Point from '@mapbox/point-geometry';
 
 import type {Painter, RenderOptions} from '../../render/painter';
@@ -15,19 +12,6 @@ import type {TileManager} from '../../tile/tile_manager';
 import type {RasterStyleLayer} from '../../style/style_layer/raster_style_layer';
 import type {OverscaledTileID} from '../../tile/tile_id';
 import type {Tile} from '../../tile/tile';
-
-type FadeProperties = {
-    parentTile: Tile;
-    parentScaleBy: number;
-    parentTopLeft: [number, number];
-    fadeValues: FadeValues;
-};
-
-type FadeValues = {
-    tileOpacity: number;
-    parentTileOpacity?: number;
-    fadeMix: {opacity: number; mix: number};
-};
 
 const cornerCoords = [
     new Point(0, 0),
@@ -120,7 +104,7 @@ function drawTiles(
 
         // create second texture - use either the current tile or fade tile to bind second texture below
         context.activeTexture.set(gl.TEXTURE1);
-        const {parentTile, parentScaleBy, parentTopLeft, fadeValues} = getFadeProperties(tile, tileManager, fadeDuration, isTerrain);
+        const {parentTile, parentScaleBy, parentTopLeft, fadeValues} = getFadeProperties(tile, tileManager, fadeDuration, isTerrain, (p) => !!p.texture);
         tile.fadeOpacity = fadeValues.tileOpacity;
         if (parentTile) {
             parentTile.fadeOpacity = fadeValues.parentTileOpacity;
@@ -147,82 +131,4 @@ function drawTiles(
             uniformValues, terrainData, projectionData, layer.id, mesh.vertexBuffer,
             mesh.indexBuffer, mesh.segments);
     }
-}
-
-/**
- * Get fade properties for current tile - either cross-fading or self-fading properties.
- */
-function getFadeProperties(tile: Tile, tileManager: TileManager, fadeDuration: number, isTerrain: boolean): FadeProperties {
-    const defaults: FadeProperties = {
-        parentTile: null,
-        parentScaleBy: 1,
-        parentTopLeft: [0, 0],
-        fadeValues: {tileOpacity: 1, parentTileOpacity: 1, fadeMix: {opacity: 1, mix: 0}}
-    };
-
-    if (fadeDuration === 0 || isTerrain) return defaults;
-
-    // cross-fade with parent first if available
-    if (tile.fadingParentID) {
-        const parentTile = tileManager.getLoadedTile(tile.fadingParentID);
-        // no parent (or an empty sparse-archive tile with no texture to fade from) — no cross-fade
-        if (!parentTile?.texture) return defaults;
-
-        const parentScaleBy = Math.pow(2, parentTile.tileID.overscaledZ - tile.tileID.overscaledZ);
-        const parentTopLeft: [number, number] = [
-            (tile.tileID.canonical.x * parentScaleBy) % 1,
-            (tile.tileID.canonical.y * parentScaleBy) % 1
-        ];
-
-        const fadeValues = getCrossFadeValues(tile, parentTile, fadeDuration);
-        return {parentTile, parentScaleBy, parentTopLeft, fadeValues};
-    }
-
-    // self-fade for edge tiles
-    if (tile.selfFading) {
-        const fadeValues = getSelfFadeValues(tile, fadeDuration);
-        return {parentTile: null, parentScaleBy: 1, parentTopLeft: [0, 0], fadeValues};
-    }
-
-    return defaults;
-}
-
-/**
- * Cross-fade values for a base tile with a parent tile (for zooming in/out)
- */
-function getCrossFadeValues(tile: Tile, parentTile: Tile, fadeDuration: number): FadeValues {
-    const currentTime = now();
-
-    const timeSinceTile = (currentTime - tile.timeAdded) / fadeDuration;
-    const timeSinceParent = (currentTime - parentTile.timeAdded) / fadeDuration;
-
-    // get fading opacity based on current fade direction
-    const doFadeIn = (tile.fadingDirection === FadingDirections.Incoming);
-    const opacity1 = clamp(timeSinceTile, 0, 1);
-    const opacity2 = clamp(1 - timeSinceParent, 0, 1);
-
-    const tileOpacity = doFadeIn ? opacity1 : opacity2;
-    const parentTileOpacity = doFadeIn ? opacity2 : opacity1;
-    const fadeMix = {
-        opacity: 1,
-        mix: 1 - tileOpacity
-    };
-
-    return {tileOpacity, parentTileOpacity, fadeMix};
-}
-
-/**
- * Simple fade-in values for tile without a parent (i.e. edge tiles)
- */
-function getSelfFadeValues(tile: Tile, fadeDuration: number): FadeValues {
-    const currentTime = now();
-
-    const timeSinceTile = (currentTime - tile.timeAdded) / fadeDuration;
-    const tileOpacity = clamp(timeSinceTile, 0, 1);
-    const fadeMix = {
-        opacity: tileOpacity,
-        mix: 0
-    };
-
-    return {tileOpacity, fadeMix};
 }

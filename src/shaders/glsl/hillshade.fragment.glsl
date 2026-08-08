@@ -1,6 +1,18 @@
 uniform sampler2D u_image;
 in vec2 v_pos;
 
+// PATCH (map2-fork): cross-fade for raster-dem tile transitions. u_image_parent is the
+// fading parent's PREPARED texture (same derivative encoding); u_fade_t mixes toward it
+// (1 = all parent). Each side gets its own zoom adjust — the prepare pass bakes a
+// zoom-dependent intensity at the TILE's zoom, so parent and child need rebasing
+// separately before their derivatives can be mixed. u_fade_opacity is the self-fade
+// multiplier for edge tiles with no parent to fade from.
+uniform sampler2D u_image_parent;
+uniform float u_fade_t;
+uniform float u_fade_opacity;
+uniform float u_zoom_adjust_parent;
+in vec2 v_pos_parent;
+
 uniform vec2 u_latrange;
 uniform float u_exaggeration;
 // PATCH (map2-fork): rescales the prepared derivative from the intensity the prepare
@@ -163,7 +175,11 @@ void main() {
     // to account for mercator projection distortion. see #4807 for details
     float scaleFactor = cos(radians((u_latrange[0] - u_latrange[1]) * (1.0 - v_pos.y) + u_latrange[1]));
 
-    vec2 deriv = ((pixel.rg * 8.0) - 4.0) * u_zoom_adjust / scaleFactor;
+    // PATCH (map2-fork): cross-fade — rebase each side's derivative at its own baked zoom
+    // before mixing (see the uniform block comment), then shade the blend as one surface.
+    vec2 deriv_tile = ((pixel.rg * 8.0) - 4.0) * u_zoom_adjust;
+    vec2 deriv_parent = ((texture(u_image_parent, v_pos_parent).rg * 8.0) - 4.0) * u_zoom_adjust_parent;
+    vec2 deriv = mix(deriv_tile, deriv_parent, u_fade_t) / scaleFactor;
 
     if (u_method == BASIC) {
         basic_hillshade(deriv);
@@ -178,6 +194,10 @@ void main() {
     } else {
         standard_hillshade(deriv);
     }
+
+    // PATCH (map2-fork): self-fade for edge tiles (no parent to cross-fade from). The
+    // render pass blends premultiplied, so scaling the whole vector fades the contribution.
+    fragColor *= u_fade_opacity;
 
 #ifdef OVERDRAW_INSPECTOR
     fragColor = vec4(1.0);

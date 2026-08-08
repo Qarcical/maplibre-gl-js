@@ -8,6 +8,14 @@ uniform sampler2D u_color_stops;
 uniform int u_color_ramp_size;
 uniform float u_opacity;
 
+// PATCH (map2-fork): cross-fade for raster-dem tile transitions — mix ELEVATIONS between
+// this tile and its fading parent before the ramp lookup (metres are ring-independent, so
+// the blend morphs the surface smoothly). u_fade_t mixes toward the parent; edge tiles
+// with no parent self-fade via u_opacity in the uniform values instead.
+uniform sampler2D u_image_parent;
+uniform float u_fade_t;
+in vec2 v_pos_parent;
+
 in vec2 v_pos;
 
 float getElevation(vec2 coord) {
@@ -24,7 +32,7 @@ float getElevationStop(int stop) {
 }
 
 void main() {
-    float el = getElevation(v_pos);
+    float el = mix(getElevation(v_pos), texture(u_image_parent, v_pos_parent).r, u_fade_t);
 
     // Binary search
     int r = (u_color_ramp_size - 1);

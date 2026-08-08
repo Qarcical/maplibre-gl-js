@@ -6,6 +6,7 @@ import {type ColorMode} from '../color_mode';
 import {
     colorReliefUniformValues
 } from '../program/color_relief_program';
+import {getFadeProperties} from './raster_fade_values';
 
 import type {Painter, RenderOptions} from '../../render/painter';
 import type {TileManager} from '../../tile/tile_manager';
@@ -59,6 +60,10 @@ function renderColorRelief(
     // PATCH (map2-fork): the DEM texture is R32F; LINEAR on float textures needs
     // OES_texture_float_linear — fall back to NEAREST without it.
     const textureFilter = (layer.paint.get('resampling') === 'nearest' || !context.floatTextureLinearSupported) ? gl.NEAREST : gl.LINEAR;
+    // PATCH (map2-fork): raster-dem tile-transition cross-fade inputs (see the fade
+    // block in the tile loop below).
+    const fadeDuration = tileManager._effectiveFadeDuration();
+    const isTerrain = !!painter.style.map.terrain;
 
     let firstTile = true;
     let colorRampSize = 0;
@@ -101,6 +106,19 @@ function renderColorRelief(
         tile.demTextureDirty = false;
         tile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
 
+        // PATCH (map2-fork): raster-dem tile-transition cross-fade — bind the fading
+        // parent's DEM texture (unit 5; 0/1/4 are taken above) and mix elevations
+        // in-shader. A parent that was on screen already has its demTexture.
+        const fade = getFadeProperties(tile, tileManager, fadeDuration, isTerrain, (p) => !!p.demTexture);
+        tile.fadeOpacity = fade.fadeValues.tileOpacity;
+        context.activeTexture.set(gl.TEXTURE5);
+        if (fade.parentTile) {
+            fade.parentTile.fadeOpacity = fade.fadeValues.parentTileOpacity;
+            fade.parentTile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
+        } else {
+            tile.demTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
+        }
+
         const mesh = projection.getMeshFromTileID(context, coord.canonical, useBorder, true, 'raster');
 
         const terrainData = painter.style.map.terrain?.getTerrainData(coord);
@@ -113,6 +131,11 @@ function renderColorRelief(
         });
 
         program.draw(context, gl.TRIANGLES, depthMode, stencilModes[coord.overscaledZ], colorMode, CullFaceMode.backCCW,
-            colorReliefUniformValues(layer, tile.dem, colorRampSize), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
+            colorReliefUniformValues(layer, tile.dem, colorRampSize, {
+                parentTile: fade.parentTile,
+                parentTopLeft: fade.parentTopLeft,
+                parentScaleBy: fade.parentScaleBy,
+                fadeMix: fade.fadeValues.fadeMix,
+            }), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
     }
 }

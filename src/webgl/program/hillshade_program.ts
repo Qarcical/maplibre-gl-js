@@ -32,6 +32,13 @@ export type HillshadeUniformsType = {
     'u_method': Uniform1i;
     'u_shadows': UniformColorArray;
     'u_highlights': UniformColorArray;
+    // PATCH (map2-fork): raster-dem tile-transition cross-fade (see draw_hillshade)
+    'u_image_parent': Uniform1i;
+    'u_tl_parent': Uniform2f;
+    'u_scale_parent': Uniform1f;
+    'u_fade_t': Uniform1f;
+    'u_fade_opacity': Uniform1f;
+    'u_zoom_adjust_parent': Uniform1f;
 };
 
 export type HillshadePrepareUniformsType = {
@@ -51,7 +58,13 @@ const hillshadeUniforms = (context: Context, locations: UniformLocations): Hills
     'u_accent': new UniformColor(context, locations.u_accent),
     'u_method': new Uniform1i(context, locations.u_method),
     'u_shadows': new UniformColorArray(context, locations.u_shadows),
-    'u_highlights': new UniformColorArray(context, locations.u_highlights)
+    'u_highlights': new UniformColorArray(context, locations.u_highlights),
+    'u_image_parent': new Uniform1i(context, locations.u_image_parent),
+    'u_tl_parent': new Uniform2f(context, locations.u_tl_parent),
+    'u_scale_parent': new Uniform1f(context, locations.u_scale_parent),
+    'u_fade_t': new Uniform1f(context, locations.u_fade_t),
+    'u_fade_opacity': new Uniform1f(context, locations.u_fade_opacity),
+    'u_zoom_adjust_parent': new Uniform1f(context, locations.u_zoom_adjust_parent)
 });
 
 const hillshadePrepareUniforms = (context: Context, locations: UniformLocations): HillshadePrepareUniformsType => ({
@@ -86,11 +99,21 @@ function getHillshadeZoomAdjust(painter: Painter, tile: Tile, sourceMaxZoom?: nu
     return Math.pow(2, stockPrepareExaggeration(tile.tileID.overscaledZ) - stockPrepareExaggeration(coverZoom));
 }
 
+// PATCH (map2-fork): the per-tile fade inputs draw_hillshade / draw_color_relief hand to
+// their uniform values — the sampling geometry plus mix from getFadeProperties.
+export type DemFadeValues = {
+    parentTile: Tile | null;
+    parentTopLeft: [number, number];
+    parentScaleBy: number;
+    fadeMix: {opacity: number; mix: number};
+};
+
 const hillshadeUniformValues = (
     painter: Painter,
     tile: Tile,
     layer: HillshadeStyleLayer,
     sourceMaxZoom?: number,
+    fade?: DemFadeValues,
 ): UniformValues<HillshadeUniformsType> => {
     const accent = layer.paint.get('hillshade-accent-color');
     let method;
@@ -131,7 +154,15 @@ const hillshadeUniformValues = (
         'u_accent': accent,
         'u_method': method,
         'u_highlights': illumination.highlightColor,
-        'u_shadows': illumination.shadowColor
+        'u_shadows': illumination.shadowColor,
+        'u_image_parent': 1,
+        'u_tl_parent': fade ? fade.parentTopLeft : [0, 0],
+        'u_scale_parent': fade ? fade.parentScaleBy : 1,
+        'u_fade_t': fade?.parentTile ? fade.fadeMix.mix : 0,
+        'u_fade_opacity': fade ? fade.fadeMix.opacity : 1,
+        'u_zoom_adjust_parent': fade?.parentTile
+            ? getHillshadeZoomAdjust(painter, fade.parentTile, sourceMaxZoom)
+            : 1
     };
 };
 

@@ -106,6 +106,14 @@ export class TileManager extends Evented {
     // preloads and never arrives nor calls releasePreloadedTiles. ~600 ≈ 10 s of moving frames.
     static preloadedTileTTLUpdates: number = 600;
 
+    // PATCH (map2-fork): cross-fade duration (ms) for raster-dem tile transitions. The
+    // DEM-driven layers (hillshade, color-relief) used to hard-cut whenever a tile ring
+    // swapped or a late tile became renderable — the flicker diagnosed 2026-08-07/08 on the
+    // terrain-heavy challenge maps. Reuses the stock raster fade state (updateFadingTiles);
+    // the draw side consumes it in draw_hillshade / draw_color_relief. 0 disables
+    // (Map#setDemFadeDuration; the challenge app's `?nodemfade` A/B).
+    _demFadeDuration: number = 200;
+
     constructor(id: string, options: SourceSpecification | CanvasSourceSpecification, dispatcher: Dispatcher) {
         super();
         this.id = id;
@@ -464,7 +472,7 @@ export class TileManager extends Evented {
         tile.timeAdded = now();
         // Since self-fading applies to unloaded tiles, fadeEndTime must be updated upon load
         if (tile.selfFading) {
-            tile.fadeEndTime = tile.timeAdded + this._rasterFadeDuration;
+            tile.fadeEndTime = tile.timeAdded + this._effectiveFadeDuration();
         }
 
         if (previousState === 'expired') tile.refreshedUponExpiration = true;
@@ -728,13 +736,16 @@ export class TileManager extends Evented {
         const retain: Record<string, OverscaledTileID> = this._updateRetainedTiles(idealTileIDs, zoom);
 
         // enable fading for raster source except when using terrain which doesn't currently support fading
+        // PATCH (map2-fork): raster-dem fades too (hillshade/color-relief hard-cut fix) —
+        // same machinery, its own duration (no raster-fade-duration paint exists for it).
         const isRaster = isRasterType(this._source.type);
-        if (isRaster && this._rasterFadeDuration > 0 && !terrain) {
-            updateFadingTiles(this._inViewTiles, idealTileIDs, retain, this._maxFadingAncestorLevels, this._source.minzoom, this._source.maxzoom, this._rasterFadeDuration);
+        const fadeDuration = this._effectiveFadeDuration();
+        if ((isRaster || this._source.type === 'raster-dem') && fadeDuration > 0 && !terrain) {
+            updateFadingTiles(this._inViewTiles, idealTileIDs, retain, this._maxFadingAncestorLevels, this._source.minzoom, this._source.maxzoom, fadeDuration);
         }
 
         // clean up non-retained tiles that are no longer needed
-        if (isRaster) {
+        if (isRaster || this._source.type === 'raster-dem') {
             this._cleanUpRasterTiles(retain);
         } else {
             this._cleanUpVectorTiles(retain);
@@ -1299,11 +1310,25 @@ export class TileManager extends Evented {
             return true;
         }
 
-        return isRasterType(this._source.type) && hasRasterTransition(this._inViewTiles, this._rasterFadeDuration);
+        // PATCH (map2-fork): raster-dem transitions keep the repaint loop alive during
+        // hillshade/color-relief cross-fades, exactly as raster fades do.
+        return (isRasterType(this._source.type) || this._source.type === 'raster-dem') &&
+            hasRasterTransition(this._inViewTiles, this._effectiveFadeDuration());
     }
 
     setRasterFadeDuration(fadeDuration: number) {
         this._rasterFadeDuration = fadeDuration;
+    }
+
+    // PATCH (map2-fork): the fade duration that applies to THIS source — raster keeps the
+    // style-driven raster-fade-duration; raster-dem uses the fork's own knob.
+    _effectiveFadeDuration(): number {
+        return this._source.type === 'raster-dem' ? this._demFadeDuration : this._rasterFadeDuration;
+    }
+
+    // PATCH (map2-fork): see _demFadeDuration; Map#setDemFadeDuration fans out here.
+    setDemFadeDuration(fadeDuration: number) {
+        this._demFadeDuration = fadeDuration;
     }
 
     /**

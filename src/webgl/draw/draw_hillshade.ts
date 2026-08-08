@@ -7,6 +7,7 @@ import {
     hillshadeUniformValues,
     hillshadeUniformPrepareValues
 } from '../program/hillshade_program';
+import {getFadeProperties} from './raster_fade_values';
 
 import type {Painter, RenderOptions} from '../../render/painter';
 import type {TileManager} from '../../tile/tile_manager';
@@ -64,6 +65,11 @@ function renderHillshade(
     const program = painter.useProgram('hillshade', null, false, defines);
     const align = !painter.options.moving;
     const sourceMaxZoom = tileManager.getSource().maxzoom;
+    // PATCH (map2-fork): raster-dem tile-transition cross-fade (same state and maths as
+    // raster's — see raster_fade_values). The parent must have a PREPARED texture to fade
+    // from; a parent that was never on screen has no fbo and the tile draws unfaded.
+    const fadeDuration = tileManager._effectiveFadeDuration();
+    const isTerrain = !!painter.style.map.terrain;
 
     for (const coord of coords) {
         const tile = tileManager.getTile(coord);
@@ -78,6 +84,16 @@ function renderHillshade(
         context.activeTexture.set(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, fbo.colorAttachment.get());
 
+        const fade = getFadeProperties(tile, tileManager, fadeDuration, isTerrain, (p) => !!p.fbo);
+        tile.fadeOpacity = fade.fadeValues.tileOpacity;
+        context.activeTexture.set(gl.TEXTURE1);
+        if (fade.parentTile) {
+            fade.parentTile.fadeOpacity = fade.fadeValues.parentTileOpacity;
+            gl.bindTexture(gl.TEXTURE_2D, fade.parentTile.fbo.colorAttachment.get());
+        } else {
+            gl.bindTexture(gl.TEXTURE_2D, fbo.colorAttachment.get());
+        }
+
         const projectionData = transform.getProjectionData({
             overscaledTileID: coord,
             aligned: align,
@@ -86,7 +102,12 @@ function renderHillshade(
         });
 
         program.draw(context, gl.TRIANGLES, depthMode, stencilModes[coord.overscaledZ], colorMode, CullFaceMode.backCCW,
-            hillshadeUniformValues(painter, tile, layer, sourceMaxZoom), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
+            hillshadeUniformValues(painter, tile, layer, sourceMaxZoom, {
+                parentTile: fade.parentTile,
+                parentTopLeft: fade.parentTopLeft,
+                parentScaleBy: fade.parentScaleBy,
+                fadeMix: fade.fadeValues.fadeMix,
+            }), terrainData, projectionData, layer.id, mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
     }
 }
 

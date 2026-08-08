@@ -2620,6 +2620,19 @@ export class Map extends Camera {
         return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr, fullZoomTr))).then(() => {});
     }
 
+    // PATCH (map2-fork): cross-fade duration for raster-dem tile transitions (hillshade /
+    // color-relief hard-cut fix — see TileManager._demFadeDuration). 0 disables. Applies to
+    // every raster-dem source; new sources pick up only the TileManager default, so call
+    // again after style swaps if a non-default value matters.
+    setDemFadeDuration(ms: number): this {
+        const managers = this.style?.tileManagers ?? {};
+        for (const id in managers) {
+            managers[id].setDemFadeDuration(ms);
+        }
+        this.triggerRepaint();
+        return this;
+    }
+
     // PATCH (map2-fork): unpin all preloaded-but-unused tiles across every source (loaded ones
     // drop into the normal LRU cache; in-flight ones are aborted). Call when the animation ends.
     releasePreloadedTiles(): void {
