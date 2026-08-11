@@ -149,6 +149,11 @@ export class TileManager extends Evented {
         this.map = map;
         this._maxTileCacheSize = map ? map._maxTileCacheSize : null;
         this._maxTileCacheZoomLevels = map ? map._maxTileCacheZoomLevels : null;
+        // PATCH (map2-fork): honour a Map#setDemFadeDuration made before this source existed
+        // (the challenge app tunes `?demfade` / `?nodemfade` at map construction, pre-style).
+        if (map && map._demFadeDurationOverride !== null && map._demFadeDurationOverride !== undefined) {
+            this._demFadeDuration = map._demFadeDurationOverride;
+        }
         if (this._source?.onAdd) {
             this._source.onAdd(map);
         }

@@ -146,7 +146,13 @@ function updateFadingChildren(
     now: number, 
     sourceMaxZoom: number,
     rasterFadeDuration: number): boolean {
-    if (childIDs[0].overscaledZ >= sourceMaxZoom) return false;
+    // PATCH (map2-fork): was `>= sourceMaxZoom`, which also rejected REAL children sitting
+    // exactly at the source's maxzoom. A zoom-out leaving a close-up (ideal ring drops from
+    // maxzoom to maxzoom-1) then found no faders, so the entire maxzoom ring hard-dropped in
+    // one frame — the SeaToSummit Pico Viejo outro flick (2026-08-11, ~96% of the viewport
+    // changing content in a single frame). Children BEYOND maxzoom are overscaled clones of
+    // the ideal tile itself (identical content), so only those are skipped.
+    if (childIDs[0].overscaledZ > sourceMaxZoom) return false;
     let foundFader = false;
 
     // find loaded child tiles to fade with the ideal tile

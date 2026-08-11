@@ -2621,10 +2621,14 @@ export class Map extends Camera {
     }
 
     // PATCH (map2-fork): cross-fade duration for raster-dem tile transitions (hillshade /
-    // color-relief hard-cut fix — see TileManager._demFadeDuration). 0 disables. Applies to
-    // every raster-dem source; new sources pick up only the TileManager default, so call
-    // again after style swaps if a non-default value matters.
+    // color-relief hard-cut fix — see TileManager._demFadeDuration). 0 disables. The value is
+    // remembered on the map and applied to tile managers created later (TileManager.onAdd), so
+    // calling before the style's sources exist — the challenge app wires `?demfade` at map
+    // construction — still takes effect.
+    _demFadeDurationOverride: number | null = null;
+
     setDemFadeDuration(ms: number): this {
+        this._demFadeDurationOverride = ms;
         const managers = this.style?.tileManagers ?? {};
         for (const id in managers) {
             managers[id].setDemFadeDuration(ms);
