@@ -4,24 +4,39 @@ import {type InViewTiles} from './tile_manager_in_view_tiles';
 /**
  * For raster terrain source, backfill DEM to eliminate visible tile boundaries
  */
-export function backfillDEM(tile: Tile, inViewTiles: InViewTiles) {
+export function backfillDEM(tile: Tile, inViewTiles: InViewTiles, preloadedTiles?: Record<string, {tile: Tile}>) {
     // PATCH (map2-fork): walk ALL in-view tiles, not just renderable ones — a fresh
     // neighbour whose first upload the scheduler still gates (Tile.gatedUpload) isn't
-    // renderable yet, and skipping it here would leave the shared border unfilled for
-    // good (backfill only runs on load). fillBorder itself guards on dem presence.
+    // renderable yet, and skipping it here would leave the shared border unfilled
+    // (backfill runs on load and on preload/LRU promotion in _addTile). fillBorder
+    // itself guards on dem presence.
     for (const borderId of inViewTiles.getAllIds()) {
-        if (!tile.neighboringTiles?.[borderId]) {
-            continue;
-        }
-        const borderTile = inViewTiles.getTileById(borderId);
-        if (!tile.neighboringTiles[borderId].backfilled) {
-            fillBorder(tile, borderTile);
-        }
-        if (borderTile.neighboringTiles?.[tile.tileID.key]?.backfilled) {
-            continue;
-        }
-        fillBorder(borderTile, tile);
+        visitNeighbor(tile, borderId, inViewTiles.getTileById(borderId));
     }
+    // PATCH (map2-fork): also walk pinned preloads — a preloaded viewport (goal-zoom
+    // window, follow-cam prediction) loads while NONE of its tiles are in view, so the
+    // in-view walk alone left every internal border clamped to the tile's own edge row.
+    // The clamped border flattens the hillshade derivative along the edge, and the seam
+    // survived promotion and the trip through the LRU: a thin light/dark line pinned to
+    // tile-row boundaries (first seen just south of the Teide summit on cantracker).
+    if (preloadedTiles) {
+        for (const borderId in preloadedTiles) {
+            visitNeighbor(tile, borderId, preloadedTiles[borderId].tile);
+        }
+    }
+}
+
+function visitNeighbor(tile: Tile, borderId: string, borderTile: Tile) {
+    if (!tile.neighboringTiles?.[borderId]) {
+        return;
+    }
+    if (!tile.neighboringTiles[borderId].backfilled) {
+        fillBorder(tile, borderTile);
+    }
+    if (borderTile.neighboringTiles?.[tile.tileID.key]?.backfilled) {
+        return;
+    }
+    fillBorder(borderTile, tile);
 }
 
 function fillBorder(tile: Tile, borderTile: Tile) {
@@ -53,4 +68,3 @@ function fillBorder(tile: Tile, borderTile: Tile) {
         tile.neighboringTiles[borderId].backfilled = true;
     }
 }
-

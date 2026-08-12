@@ -486,7 +486,9 @@ export class TileManager extends Evented {
         if (result?.unmodified) return;
 
         if (this.getSource().type === 'raster-dem' && tile.dem) {
-            backfillDEM(tile, this._inViewTiles);
+            // PATCH (map2-fork): include pinned preloads in the walk — a preloaded
+            // viewport's tiles are each other's neighbours long before any is in view.
+            backfillDEM(tile, this._inViewTiles, this._preloadedTiles);
         }
         this._state.initializeTileState(tile, this.map ? this.map.painter : null);
 
@@ -1076,6 +1078,15 @@ export class TileManager extends Evented {
         this._inViewTiles.setTile(tileID.key, tile);
         if (!cached) {
             this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
+        }
+
+        // PATCH (map2-fork): a promoted preload or LRU-restored DEM tile skipped the
+        // load-time backfill (only _tileLoaded runs it), so it can re-enter view with
+        // clamped borders — visible as a thin hillshade seam on tile edges. Backfill
+        // against whatever is around now; the per-direction `backfilled` flags make
+        // this a no-op for tiles that were already filled.
+        if (cached && this.getSource().type === 'raster-dem' && tile.dem) {
+            backfillDEM(tile, this._inViewTiles, this._preloadedTiles);
         }
 
         // PATCH (map2-fork): a tile promoted from the cache (or a preload pin) may have
