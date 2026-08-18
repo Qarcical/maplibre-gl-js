@@ -295,6 +295,9 @@ type FlightPrep = {
 export type FlightPreloadSample = {
     tr: ITransform;
     fullZoomTr?: ITransform;
+    // true for the DESTINATION sample: vector sources take a one-tile margin around its
+    // cover (the live landing camera sits within a fraction of a tile of the prediction).
+    margin?: boolean;
 };
 
 export abstract class Camera extends Evented {
@@ -1547,7 +1550,7 @@ export abstract class Camera extends Evented {
         // flyTo call itself; tiles already pinned there dedupe here, so both together are cheap.
         if (options.preloadTiles) {
             for (const sample of this._sampleFlightPath(prep)) {
-                this._preloadTransform(sample.tr, sample.fullZoomTr).catch(() => {});
+                this._preloadTransform(sample.tr, sample.fullZoomTr, sample.margin).catch(() => {});
             }
         }
 
@@ -1804,10 +1807,33 @@ export abstract class Camera extends Evented {
         // same thing the (field-proven smooth) no-prefetch behaviour shows.
         // Each clamped sample keeps its pre-clamp clone (fullZoomTr): raster-dem
         // sources preload from THAT — see TileManager.preloadTiles for why.
-        const out: FlightPreloadSample[] = samples.map((tr) => ({tr}));
+        //
+        // PATCH (map2-fork, 2026-08-17 canals pop-in): the DESCENT's landing phase is
+        // exempt from the clamp. "Mid-flight renders coarse from the pinned parents" is
+        // only invisible for content that exists in the parents — layers whose DATA
+        // starts at a zoom (district_buildings z10, dykes z11, …) have nothing in the
+        // coarse ring, so the whole layer pops in at ~full opacity when the fine ring
+        // finally lands (its style fade window went by while the parent was on
+        // screen). Field: Gravely Hill's z12.2 landing over Birmingham — 36/47 vector
+        // loads reactive, z10 aborted mid-flight, z11 arriving at camera z11.5-11.9.
+        // Descent samples within `_pathPreloadDescentFullLv` of the destination keep
+        // full detail so each ring is resident BEFORE the camera reaches it; the
+        // ascent (rings being left, mostly resident anyway) and any deeper part of the
+        // descent stay clamped. Vector-only cost: a few samples × ~10 tiles.
+        const out: FlightPreloadSample[] = samples.map((tr, i) => ({tr, margin: i === samples.length - 1}));
         if (this._pathPreloadCoarseDrop > 0 && samples.length > 1) {
             const destZoom = samples[samples.length - 1].zoom;
+            let apexIdx = 0;
+            for (let i = 1; i < samples.length; i++) {
+                if (samples[i].zoom < samples[apexIdx].zoom) {
+                    apexIdx = i;
+                }
+            }
             for (let i = 0; i < samples.length - 1; i++) {
+                const onDescent = i >= apexIdx && samples[i].zoom >= destZoom - this._pathPreloadDescentFullLv;
+                if (onDescent) {
+                    continue;
+                }
                 const clamped = Math.min(samples[i].zoom, destZoom - this._pathPreloadCoarseDrop);
                 if (clamped < samples[i].zoom) {
                     out[i].fullZoomTr = samples[i].clone();
@@ -1816,6 +1842,24 @@ export abstract class Camera extends Evented {
             }
         }
         return out;
+    }
+
+    /**
+     * PATCH (map2-fork): descent samples within this many zoom levels of the flight's
+     * DESTINATION are exempt from the mid-path coarse clamp (see _sampleFlightPath) — the
+     * landing approach preloads its rings at full detail so data-minzoom-gated layers
+     * (buildings, ditches, contour sets) fade in as the style intends instead of popping
+     * when the fine ring lands. 0 restores the old behaviour (everything mid-path clamped).
+     */
+    _pathPreloadDescentFullLv: number = 3;
+
+    /**
+     * PATCH (map2-fork): override the descent full-detail allowance (see
+     * _pathPreloadDescentFullLv). The challenge app's `?descentfull=N` A/B.
+     */
+    setPathPreloadDescentFullLv(lv: number): this {
+        this._pathPreloadDescentFullLv = Math.max(0, lv);
+        return this;
     }
 
     /**
@@ -1848,7 +1892,7 @@ export abstract class Camera extends Evented {
         if (!prep) {
             return this.preloadCamera(pick(options, ['center', 'zoom', 'bearing', 'pitch', 'roll', 'elevation', 'padding']) as JumpToOptions);
         }
-        return Promise.allSettled(this._sampleFlightPath(prep).map((sample) => this._preloadTransform(sample.tr, sample.fullZoomTr))).then(() => {});
+        return Promise.allSettled(this._sampleFlightPath(prep).map((sample) => this._preloadTransform(sample.tr, sample.fullZoomTr, sample.margin))).then(() => {});
     }
 
     // PATCH (map2-fork): preload every source's tiles for a FUTURE camera position, so a scripted
@@ -1856,7 +1900,14 @@ export abstract class Camera extends Evented {
     // the same options as jumpTo and applies them to a CLONE of the current transform, so viewport
     // size and bearing/pitch defaults behave identically. Preloaded tiles are pinned (immune to
     // cache eviction) until promoted on arrival or released via Map#releasePreloadedTiles.
-    preloadCamera(options: JumpToOptions): Promise<void> {
+    // `preloadOptions.margin` (default TRUE — a preloadCamera call is a destination-class
+    // preload) gives vector sources a one-tile margin around the cover: the live camera lands
+    // within a fraction of a tile of the predicted one (padding changes between preload and
+    // arrival, leash/landing-glide centre shifts), and an edge row/column that leaks past the
+    // preload loads reactively on arrival — for data-minzoom-gated layers that's a visible pop
+    // (2026-08-17 canals Taunton: one z12 column). Path samplers pass margin:false for their
+    // intermediate (densely overlapping) samples.
+    preloadCamera(options: JumpToOptions, preloadOptions?: {margin?: boolean}): Promise<void> {
         if (this._preloadDebug) {
             console.log('[map2-fork] preloadCamera', JSON.stringify({center: options.center, zoom: options.zoom}));
         }
@@ -1877,7 +1928,7 @@ export abstract class Camera extends Evented {
         if (options.padding != null) {
             tr.setPadding(options.padding);
         }
-        return this._preloadTransform(tr);
+        return this._preloadTransform(tr, undefined, preloadOptions?.margin !== false);
     }
 
     // PATCH (map2-fork): when true, every preload entry point logs what it requested and every
@@ -1887,8 +1938,9 @@ export abstract class Camera extends Evented {
     // PATCH (map2-fork): preload the tiles covering a future transform. Camera has no access to
     // the style's sources, so this is a no-op here; Map overrides it with the real fan-out. flyTo
     // uses it to prefetch its sampled flight path when `preloadTiles: true` is passed.
-    // `fullZoomTr` is the pre-clamp clone of a coarse-clamped flight sample (FlightPreloadSample).
-    _preloadTransform(_tr: ITransform, _fullZoomTr?: ITransform): Promise<void> {
+    // `fullZoomTr` is the pre-clamp clone of a coarse-clamped flight sample (FlightPreloadSample);
+    // `margin` marks a destination-class preload (vector one-tile margin — TileManager.preloadTiles).
+    _preloadTransform(_tr: ITransform, _fullZoomTr?: ITransform, _margin?: boolean): Promise<void> {
         return Promise.resolve();
     }
 

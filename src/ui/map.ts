@@ -2614,10 +2614,11 @@ export class Map extends Camera {
     // source's tiles for the given future transform. Also reached by flyTo's `preloadTiles`
     // option, which samples its flight path and preloads each sampled viewport through this.
     // `fullZoomTr` (pre-clamp clone of a coarse-clamped flight sample) is offered to every
-    // manager; only raster-dem managers use it — see TileManager.preloadTiles.
-    override _preloadTransform(tr: ITransform, fullZoomTr?: ITransform): Promise<void> {
+    // manager; only raster-dem managers use it — see TileManager.preloadTiles. `margin` marks a
+    // destination-class preload (vector managers take a one-tile margin around the cover).
+    override _preloadTransform(tr: ITransform, fullZoomTr?: ITransform, margin?: boolean): Promise<void> {
         const managers = Object.values(this.style?.tileManagers ?? {});
-        return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr, fullZoomTr))).then(() => {});
+        return Promise.allSettled(managers.map((tm) => tm.preloadTiles(tr, fullZoomTr, margin))).then(() => {});
     }
 
     // PATCH (map2-fork): cross-fade duration for raster-dem tile transitions (hillshade /

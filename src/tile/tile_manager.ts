@@ -783,7 +783,7 @@ export class TileManager extends Evented {
     // upload remains, on first render). Resolves when every newly requested tile settles
     // (loaded or errored). Tiles already in view, already pinned, or already cached are reused.
     // Not supported for image sources or terrain-ancestor expansion (unused by our exports).
-    async preloadTiles(transform: ITransform, fullZoomTransform?: ITransform): Promise<void> {
+    async preloadTiles(transform: ITransform, fullZoomTransform?: ITransform, margin?: boolean): Promise<void> {
         const debug = this.map?._preloadDebug;
         // PATCH (map2-fork): raster-dem ignores the flight sampler's mid-path coarse clamp and
         // preloads at the full ring zoom (fullZoomTransform is the pre-clamp sample clone). A
@@ -822,10 +822,17 @@ export class TileManager extends Evented {
         // preload aims at a PREDICTED camera (stepCamera during the date tween, flight samples
         // at scan resolution), and the live camera lands within a fraction of a tile of it —
         // enough to want one extra row/column the prediction missed (headless tile-id capture
-        // 2026-08-07: a single 6-tile z14 row loading reactively on arrival). Vector doesn't
-        // need it (parents substitute invisibly); DEM tiles are small and the margin dedupes
-        // against existing pins, so it's cheap insurance against every sub-tile aim error.
-        if (this._source.type === 'raster-dem' && idealTileIDs.length > 0) {
+        // 2026-08-07: a single 6-tile z14 row loading reactively on arrival). DEM tiles are
+        // small and the margin dedupes against existing pins, so it's cheap insurance against
+        // every sub-tile aim error.
+        // Vector sources take the same margin for DESTINATION-class preloads (`margin`:
+        // preloadCamera and a flight's landing sample). "Parents substitute invisibly" — the
+        // original reason vector skipped it — is false for layers whose DATA begins at a zoom
+        // (buildings, ditches, contour sets): a leaked edge column loads reactively on arrival
+        // and the whole layer pops in there (2026-08-17 canals Taunton, one z12 column past the
+        // window prefetch). Intermediate path samples overlap densely and pass margin=false.
+        const takeMargin = this._source.type === 'raster-dem' || (margin && this._source.type === 'vector');
+        if (takeMargin && idealTileIDs.length > 0) {
             const seen = new Set(idealTileIDs.map((id) => id.key));
             const margin: OverscaledTileID[] = [];
             for (const id of idealTileIDs) {
