@@ -104,7 +104,14 @@ export class TileManager extends Evented {
     // PATCH (map2-fork): a pinned preload not promoted within this many update() calls is
     // auto-released (loaded → LRU, in-flight → aborted) — the backstop for a caller that
     // preloads and never arrives nor calls releasePreloadedTiles. ~600 ≈ 10 s of moving frames.
-    static preloadedTileTTLUpdates: number = 600;
+    // PATCH (map2-fork, 2026-08-20): 600 updates ≈ 5 s at the Mac's 120 Hz — SHORTER than the
+    // challenge app's own prefetch leads (the rolling tween prefetch fires 6 s ahead; the tail's
+    // home-leg samples 6.5 s ahead), so correctly-prepaid pins expired ~1.5 s before use, dropped
+    // to the LRU, were evicted under country-hop churn, and the home-leg/flight rings reloaded
+    // reactively (probe: Ramsbottom → North Downs East, 45 reactive composite loads on a fully
+    // prepaid retreat). 2400 ≈ 20 s at 120 Hz — still a bounded-leak backstop, comfortably above
+    // every scripted lead.
+    static preloadedTileTTLUpdates: number = 2400;
 
     // PATCH (map2-fork): cross-fade duration (ms) for raster-dem tile transitions. The
     // DEM-driven layers (hillshade, color-relief) used to hard-cut whenever a tile ring
