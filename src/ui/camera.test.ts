@@ -4032,23 +4032,72 @@ describe('zoomSnap', () => {
     });
 });
 
-// PATCH (map2-fork): mid-path flight-preload samples are clamped coarse — only the
-// destination sample keeps full detail (see _sampleFlightPath)
+// PATCH (map2-fork): mid-path flight-preload samples are clamped coarse, EXCEPT the
+// landing approach — descent samples within _pathPreloadDescentFullLv of the destination
+// keep full detail so data-minzoom-gated layers don't pop (see _sampleFlightPath)
 describe('flight path preload coarse clamp', () => {
+    const DROP = 2.5;             // _pathPreloadCoarseDrop default
+    const DESCENT_FULL_LV = 3;    // _pathPreloadDescentFullLv default
+
     function samplesForLongFlight(camera) {
         const prep = (camera as any)._prepareFlight({center: [10, 0], zoom: 14}, camera.transform.clone());
         expect(prep).toBeTruthy();
         return (camera as any)._sampleFlightPath(prep);
     }
 
-    test('mid-path samples are clamped to destZoom − drop; the destination keeps full zoom', () => {
+    // The zoom the sample sits at ON THE PATH — clamping rewrites tr, stashing the
+    // original in fullZoomTr, so that clone is the pre-clamp truth where it exists.
+    const pathZoom = (s) => (s.fullZoomTr ? s.fullZoomTr.zoom : s.tr.zoom);
+
+    test('mid-path samples are clamped to destZoom − drop, except the landing approach', () => {
         const camera = createCamera();
         camera.jumpTo({center: [0, 0], zoom: 14});
         const samples = samplesForLongFlight(camera);
         expect(samples.length).toBeGreaterThan(2);
+
+        // The destination is never clamped.
+        expect(samples[samples.length - 1].tr.zoom).toBeCloseTo(14, 1);
+        expect(samples[samples.length - 1].fullZoomTr).toBeUndefined();
+
+        // The apex is the shallowest point on the path; everything after it is the descent.
+        let apexIdx = 0;
+        for (let i = 1; i < samples.length; i++) {
+            if (pathZoom(samples[i]) < pathZoom(samples[apexIdx])) {
+                apexIdx = i;
+            }
+        }
+
+        let clamped = 0, exempt = 0;
+        for (let i = 0; i < samples.length - 1; i++) {
+            const s = samples[i];
+            if (s.fullZoomTr) {
+                // Clamped: sits at the coarse ring, and the ascent is always clamped.
+                clamped++;
+                expect(s.tr.zoom).toBeLessThanOrEqual(14 - DROP + 1e-9);
+            } else if (pathZoom(s) > 14 - DROP + 1e-9) {
+                // Left at full detail: only ever the landing approach, never the ascent
+                // (rings being LEFT are already resident) and never deeper than the window.
+                exempt++;
+                expect(i).toBeGreaterThanOrEqual(apexIdx);
+                expect(pathZoom(s)).toBeGreaterThanOrEqual(14 - DESCENT_FULL_LV - 1e-9);
+            }
+            // else: naturally coarser than the clamp already (the apex region) — nothing to assert.
+        }
+
+        // Both halves of the patch must still be doing something.
+        expect(clamped).toBeGreaterThan(0);
+        expect(exempt).toBeGreaterThan(0);
+    });
+
+    test('setPathPreloadDescentFullLv(0) restores the strict clamp on every mid-path sample', () => {
+        const camera = createCamera();
+        camera.jumpTo({center: [0, 0], zoom: 14});
+        camera.setPathPreloadDescentFullLv(0);
+        const samples = samplesForLongFlight(camera);
+        expect(samples.length).toBeGreaterThan(2);
         expect(samples[samples.length - 1].tr.zoom).toBeCloseTo(14, 1);
         for (let i = 0; i < samples.length - 1; i++) {
-            expect(samples[i].tr.zoom).toBeLessThanOrEqual(14 - 2.5 + 1e-9);
+            expect(samples[i].tr.zoom).toBeLessThanOrEqual(14 - DROP + 1e-9);
         }
     });
 
