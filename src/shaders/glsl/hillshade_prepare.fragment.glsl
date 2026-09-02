@@ -16,33 +16,24 @@ float getElevation(vec2 coord, float bias) {
 }
 
 void main() {
-    vec2 epsilon = 1.0 / u_dimension;
+    vec2 halfTexel = 0.5 / u_dimension;
     float tileSize = u_dimension.x - 2.0;
 
-    // queried pixels:
-    // +-----------+
-    // |   |   |   |
-    // | a | b | c |
-    // |   |   |   |
-    // +-----------+
-    // |   |   |   |
-    // | d | e | f |
-    // |   |   |   |
-    // +-----------+
-    // |   |   |   |
-    // | g | h | i |
-    // |   |   |   |
-    // +-----------+
+    // PATCH (map2-fork): node-centred 2x2 kernel. v_pos sits on the boundary between two
+    // DEM texels in each axis, so taps at +/- half a texel land exactly on the four cell
+    // centres around the node:
+    // +---------+
+    // | nw | ne |
+    // +----o----+   o = v_pos (the node)
+    // | sw | se |
+    // +---------+
+    // Every tap stays within one texel of the node, so a node ON a tile edge needs only
+    // the 1px backfilled border ring — no wider DEM border is required.
 
-    float a = getElevation(v_pos + vec2(-epsilon.x, -epsilon.y), 0.0);
-    float b = getElevation(v_pos + vec2(0, -epsilon.y), 0.0);
-    float c = getElevation(v_pos + vec2(epsilon.x, -epsilon.y), 0.0);
-    float d = getElevation(v_pos + vec2(-epsilon.x, 0), 0.0);
-    float e = getElevation(v_pos, 0.0);
-    float f = getElevation(v_pos + vec2(epsilon.x, 0), 0.0);
-    float g = getElevation(v_pos + vec2(-epsilon.x, epsilon.y), 0.0);
-    float h = getElevation(v_pos + vec2(0, epsilon.y), 0.0);
-    float i = getElevation(v_pos + vec2(epsilon.x, epsilon.y), 0.0);
+    float nw = getElevation(v_pos + vec2(-halfTexel.x, -halfTexel.y), 0.0);
+    float ne = getElevation(v_pos + vec2(halfTexel.x, -halfTexel.y), 0.0);
+    float sw = getElevation(v_pos + vec2(-halfTexel.x, halfTexel.y), 0.0);
+    float se = getElevation(v_pos + vec2(halfTexel.x, halfTexel.y), 0.0);
 
     // Here we divide the x and y slopes by 8 * pixel size
     // where pixel size (aka meters/pixel) is:
@@ -59,9 +50,12 @@ void main() {
     float exaggerationFactor = u_zoom < 2.0 ? 0.4 : u_zoom < 4.5 ? 0.35 : 0.3;
     float exaggeration = u_zoom < 15.0 ? (u_zoom - 15.0) * exaggerationFactor : 0.0;
 
-    vec2 deriv = vec2(
-        (c + f + f + i) - (a + d + d + g),
-        (g + h + h + i) - (a + b + b + c)
+    // PATCH (map2-fork): x4 keeps the stored magnitude identical to the 3x3 Sobel this
+    // replaces. The Sobel spanned two cells with weight 4 per side (8 * dz/dcell); the
+    // 2x2 spans one cell with weight 2 per side (2 * dz/dcell).
+    vec2 deriv = 4.0 * vec2(
+        (ne + se) - (nw + sw),
+        (sw + se) - (nw + ne)
     ) * tileSize / pow(2.0, exaggeration + (28.2562 - u_zoom));
 
     fragColor = clamp(vec4(

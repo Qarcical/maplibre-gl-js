@@ -155,7 +155,11 @@ function prepareHillshade(
         }
         painter.demPreparesThisFrame++;
 
-        const tileSize = dem.dim;
+        // PATCH (map2-fork): the derivative is computed on a NODE grid — one sample per
+        // DEM cell CORNER, so (dim+1)² not dim². The extra row/column is what lets two
+        // tiles agree on their shared edge (see hillshade_prepare.vertex.glsl); it costs
+        // ~0.4% of the fbo and nothing at draw time.
+        const prepareSize = dem.dim + 1;
 
         // PATCH (map2-fork): the DEM uploads as R32F metres (shared tile.demTexture with
         // color-relief; see draw_color_relief.ts). NEAREST as before — the prepare pass taps
@@ -178,10 +182,10 @@ function prepareHillshade(
         let fbo = tile.fbo;
 
         if (!fbo) {
-            const renderTexture = new Texture(context, {width: tileSize, height: tileSize, data: null}, gl.RGBA);
+            const renderTexture = new Texture(context, {width: prepareSize, height: prepareSize, data: null}, gl.RGBA);
             renderTexture.bind(textureFilter, gl.CLAMP_TO_EDGE);
 
-            fbo = tile.fbo = context.createFramebuffer(tileSize, tileSize, true, false);
+            fbo = tile.fbo = context.createFramebuffer(prepareSize, prepareSize, true, false);
             fbo.colorAttachment.set(renderTexture.texture);
             // The wrapper isn't retained anywhere else — hand it to the fbo so
             // unloadTile's fbo.destroy() decrements the glMem gauge (see Framebuffer).
@@ -189,7 +193,7 @@ function prepareHillshade(
         }
 
         context.bindFramebuffer.set(fbo.framebuffer);
-        context.viewport.set([0, 0, tileSize, tileSize]);
+        context.viewport.set([0, 0, prepareSize, prepareSize]);
 
         painter.useProgram('hillshadePrepare').draw(context, gl.TRIANGLES,
             depthMode, stencilMode, colorMode, CullFaceMode.disabled,

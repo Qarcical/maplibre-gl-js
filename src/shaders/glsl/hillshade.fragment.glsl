@@ -12,6 +12,9 @@ uniform float u_fade_t;
 uniform float u_fade_opacity;
 uniform float u_zoom_adjust_parent;
 in vec2 v_pos_parent;
+// PATCH (map2-fork): tile-space y (see hillshade.vertex.glsl) — v_pos is inset onto the
+// node grid's texel centres and is no longer edge-to-edge tile space.
+in float v_tile_y;
 
 uniform vec2 u_latrange;
 uniform float u_exaggeration;
@@ -173,7 +176,7 @@ void main() {
 
     // We divide the slope by a scale factor based on the cosin of the pixel's approximate latitude
     // to account for mercator projection distortion. see #4807 for details
-    float scaleFactor = cos(radians((u_latrange[0] - u_latrange[1]) * (1.0 - v_pos.y) + u_latrange[1]));
+    float scaleFactor = cos(radians((u_latrange[0] - u_latrange[1]) * (1.0 - v_tile_y) + u_latrange[1]));
 
     // PATCH (map2-fork): cross-fade — rebase each side's derivative at its own baked zoom
     // before mixing (see the uniform block comment), then shade the blend as one surface.

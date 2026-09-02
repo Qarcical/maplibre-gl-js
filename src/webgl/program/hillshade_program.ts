@@ -39,6 +39,8 @@ export type HillshadeUniformsType = {
     'u_fade_t': Uniform1f;
     'u_fade_opacity': Uniform1f;
     'u_zoom_adjust_parent': Uniform1f;
+    // PATCH (map2-fork): node-grid sampling map (see hillshade.vertex.glsl)
+    'u_node_map': Uniform2f;
 };
 
 export type HillshadePrepareUniformsType = {
@@ -64,7 +66,8 @@ const hillshadeUniforms = (context: Context, locations: UniformLocations): Hills
     'u_scale_parent': new Uniform1f(context, locations.u_scale_parent),
     'u_fade_t': new Uniform1f(context, locations.u_fade_t),
     'u_fade_opacity': new Uniform1f(context, locations.u_fade_opacity),
-    'u_zoom_adjust_parent': new Uniform1f(context, locations.u_zoom_adjust_parent)
+    'u_zoom_adjust_parent': new Uniform1f(context, locations.u_zoom_adjust_parent),
+    'u_node_map': new Uniform2f(context, locations.u_node_map)
 });
 
 const hillshadePrepareUniforms = (context: Context, locations: UniformLocations): HillshadePrepareUniformsType => ({
@@ -162,9 +165,19 @@ const hillshadeUniformValues = (
         'u_fade_opacity': fade ? fade.fadeMix.opacity : 1,
         'u_zoom_adjust_parent': fade?.parentTile
             ? getHillshadeZoomAdjust(painter, fade.parentTile, sourceMaxZoom)
-            : 1
+            : 1,
+        // PATCH (map2-fork): the prepared texture is a (dim+1)² node grid, so tile space
+        // [0,1] samples texel centres [0.5, dim+0.5] / (dim+1). Parent and child come from
+        // the same source and share dim, so one map serves both taps.
+        'u_node_map': getNodeMap(tile)
     };
 };
+
+// PATCH (map2-fork): scale/offset that map tile space onto the node grid's texel centres.
+function getNodeMap(tile: Tile): [number, number] {
+    const dim = tile.dem ? tile.dem.dim : tile.tileSize;
+    return [dim / (dim + 1), 0.5 / (dim + 1)];
+}
 
 const hillshadeUniformPrepareValues = (tileID: OverscaledTileID, dem: DEMData): UniformValues<HillshadePrepareUniformsType> => {
 
