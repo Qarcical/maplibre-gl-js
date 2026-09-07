@@ -158,6 +158,73 @@ export const glMem: GlMemGauge = {
     bufferCount: 0,
 };
 
+/**
+ * PATCH (map2-fork): per-tag breakdown of `glMem.bufferBytes` — "WHICH layers hold the
+ * vector geometry".
+ *
+ * The gauge above says the phone is holding ~440MB of decoded geometry when it dies; it
+ * cannot say whether that is contours, scree, or elevation bands, and that is the only
+ * thing that picks a lever. Tags are `<sourceID>/<layerId>`, applied by Tile#upload around
+ * each bucket's own upload — the single funnel through which tile geometry reaches GL.
+ *
+ * Tracked UNCONDITIONALLY, for the same reason the gauge is: a buffer must be subtracted
+ * from the tag it was added to, so tracking that starts when glstats is enabled mid-session
+ * would drive live tags negative as pre-existing buffers are destroyed. Each buffer carries
+ * its own tag for exactly this reason — a tag is never re-derived at destroy time.
+ *
+ * Anything created outside a bucket upload (terrain meshes, raster bounds, debug geometry)
+ * lands in UNTAGGED, which is itself worth reading: if it is large, tile geometry is not
+ * where the bytes are.
+ */
+export const UNTAGGED = '(untagged)';
+
+export type GlMemTag = {bytes: number; count: number};
+
+/** Bounded by the style's (source, layer) pair count — ~83 layers on trigpoints. */
+export const glMemBufferTags: Map<string, GlMemTag> = new Map();
+
+let currentBufferTag: string = UNTAGGED;
+
+/** Set by Tile#upload around a bucket's upload; restored to UNTAGGED afterwards. */
+export function setBufferMemTag(tag: string | null) {
+    currentBufferTag = tag || UNTAGGED;
+}
+
+export function addTaggedBufferBytes(tag: string, bytes: number) {
+    const entry = glMemBufferTags.get(tag);
+    if (entry) {
+        entry.bytes += bytes;
+        entry.count++;
+    } else {
+        glMemBufferTags.set(tag, {bytes, count: 1});
+    }
+}
+
+export function removeTaggedBufferBytes(tag: string, bytes: number) {
+    const entry = glMemBufferTags.get(tag);
+    if (!entry) return;
+    entry.bytes -= bytes;
+    entry.count--;
+}
+
+/** The tag a buffer being constructed right now belongs to. */
+export function currentBufferMemTag(): string {
+    return currentBufferTag;
+}
+
+/**
+ * Live tags by resident bytes, biggest first. Empty tags are dropped from the report but
+ * kept in the map — a layer that has just been released should read as gone, not linger.
+ */
+export function topBufferMemTags(limit: number): Array<{tag: string; bytes: number; count: number}> {
+    const out: Array<{tag: string; bytes: number; count: number}> = [];
+    glMemBufferTags.forEach((entry, tag) => {
+        if (entry.bytes > 0) out.push({tag, bytes: entry.bytes, count: entry.count});
+    });
+    out.sort((a, b) => b.bytes - a.bytes);
+    return out.slice(0, limit);
+}
+
 class GlStats {
     /** counting is skipped entirely when disabled — the call sites are render-loop hot */
     enabled: boolean = false;

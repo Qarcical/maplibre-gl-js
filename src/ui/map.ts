@@ -27,7 +27,7 @@ import {type Source} from '../source/source';
 import {type StyleLayer} from '../style/style_layer';
 import {Terrain} from '../render/terrain';
 import {RenderToTexture} from '../webgl/render_to_texture';
-import {glStats, glMem, summarizeGlStats, type GlStatsFrame} from '../webgl/gl_stats';
+import {glStats, glMem, summarizeGlStats, topBufferMemTags, type GlStatsFrame} from '../webgl/gl_stats';
 import {config} from '../util/config';
 import {defaultLocale} from './default_locale';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
@@ -4153,12 +4153,22 @@ export class Map extends Camera {
             bufferCount: glMem.bufferCount,
             heapMB: perfMemory ? mb(perfMemory.usedJSHeapSize) : undefined,
         };
+        // PATCH (map2-fork): which layers the resident geometry belongs to. Carried as its
+        // OWN field rather than folded into the `mem` line's text, so the long-standing
+        // [glstats] format (and everything that regexes it) is untouched.
+        const bufTop = topBufferMemTags(12).map(t => ({
+            tag: t.tag,
+            mb: Math.round(t.bytes / 1048576),
+            bytes: t.bytes,
+            count: t.count,
+        }));
         this.fire(new Event('glstats', {
             frames: this._glStatsFrames.length,
             median,
             max,
             framePerf,
             mem,
+            bufTop,
         }));
         // keep the last frame so getGlStats stays readable between reports
         this._glStatsFrames = [this._glStatsFrames[this._glStatsFrames.length - 1]];

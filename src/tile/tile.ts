@@ -10,6 +10,7 @@ import {now} from '../util/time_control';
 import {toEvaluationFeature} from '../data/evaluation_feature';
 import {EvaluationParameters} from '../style/evaluation_parameters';
 import {rtlMainThreadPluginFactory} from '../source/rtl_text_plugin_main_thread';
+import {setBufferMemTag} from '../webgl/gl_stats';
 
 const CLOCK_SKEW_RETRY_TIMEOUT = 30000;
 
@@ -45,6 +46,18 @@ import type {Painter} from '../render/painter';
  * - `expired` Tile data was previously loaded, but has expired per its HTTP headers and is in the process of refreshing.
  */
 export type TileState = 'loading' | 'loaded' | 'reloading' | 'unloaded' | 'errored' | 'expired';
+
+/**
+ * PATCH (map2-fork): the resident-buffer attribution tag for a bucket — `<source>/<layer>`.
+ * The source is read off the bucket's own layers rather than stored on the bucket, because
+ * only SymbolBucket keeps `sourceID`; `layers` is populated for every bucket type by
+ * `deserialize`. A bucket whose layers all vanished from the style is possible in principle
+ * (a style edit racing an in-flight tile), so the source falls back rather than throwing.
+ */
+function bucketMemTag(bucket: Bucket, layerId: string): string {
+    const layer = bucket.layers && bucket.layers.length ? bucket.layers[0] : null;
+    return `${layer && layer.source ? layer.source : '?'}/${layerId}`;
+}
 
 /** @internal */
 type CrossFadeArgs = {
@@ -358,7 +371,20 @@ export class Tile {
         for (const id in this.buckets) {
             const bucket = this.buckets[id];
             if (bucket.uploadPending()) {
-                bucket.upload(context);
+                // PATCH (map2-fork): attribute every buffer this bucket is about to create
+                // to `<sourceID>/<layerId>`. This loop is the single funnel through which
+                // tile geometry reaches GL, so tagging here covers all of it — vertex,
+                // index and the data-driven paint arrays underneath programConfigurations.
+                // The bucket key is the FIRST layer of a family (layers with identical
+                // layout share one bucket), so the tag names the family, not every member.
+                // try/finally because a stale tag would silently mis-attribute everything
+                // uploaded after it, which is worse than the error that caused it.
+                setBufferMemTag(bucketMemTag(bucket, id));
+                try {
+                    bucket.upload(context);
+                } finally {
+                    setBufferMemTag(null);
+                }
             }
         }
 
