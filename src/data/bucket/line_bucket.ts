@@ -261,6 +261,15 @@ export class LineBucket implements Bucket {
         }
         this.gradients = {};
         this.layoutVertexBuffer.destroy();
+        // PATCH (map2-fork): stock creates the ext (line-gradient / line-distance) vertex
+        // buffer in upload() and never destroys it here — the ONE buffer of everything a
+        // bucket allocates that no destroy path reaches, and LineBucket is the only bucket
+        // type with such a gap. Every re-parse of a line-gradient tile therefore stranded a
+        // live GL buffer: the anim-track ratchet in the challenge app, where the animated
+        // track setData()s (and so re-parses) once or twice a chapter — ~one tile's worth of
+        // buffers leaked per chapter, 27MB over a field playback, and hundreds of MB under a
+        // per-frame setData.
+        this.layoutVertexBuffer2?.destroy();
         this.indexBuffer.destroy();
         this.programConfigurations.destroy();
         this.segments.destroy();

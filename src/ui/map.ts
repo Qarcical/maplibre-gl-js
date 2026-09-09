@@ -27,7 +27,8 @@ import {type Source} from '../source/source';
 import {type StyleLayer} from '../style/style_layer';
 import {Terrain} from '../render/terrain';
 import {RenderToTexture} from '../webgl/render_to_texture';
-import {glStats, glMem, summarizeGlStats, topBufferMemTags, type GlStatsFrame} from '../webgl/gl_stats';
+import {glStats, glMem, summarizeGlStats, topBufferMemTags, glMemBufferOwners,
+    glMemOwnerStackCounts, setBufferOwnerStackThreshold, type GlStatsFrame} from '../webgl/gl_stats';
 import {config} from '../util/config';
 import {defaultLocale} from './default_locale';
 import {MercatorTransform} from '../geo/projection/mercator_transform';
@@ -4173,6 +4174,118 @@ export class Map extends Camera {
         // keep the last frame so getGlStats stays readable between reports
         this._glStatsFrames = [this._glStatsFrames[this._glStatsFrames.length - 1]];
         this._glStatsLastReport = timestamp;
+    }
+
+    /**
+     * PATCH (map2-fork, 2026-09-09): find resident buffers whose TILE is gone.
+     *
+     * `[bufmem]` says which layers hold the geometry; it cannot say whether a tile the
+     * source no longer holds is still holding buffers — the shape of the anim-track leak
+     * (handover §4.23: ~300 live buffers on a source whose manager holds 2-6 tiles). This
+     * joins the per-tile owners (gl_stats) against EVERY retention store a tile can legally
+     * live in — in view, the out-of-view LRU, and the fork's preload pins, plus the terrain
+     * manager's own RTT tiles — so anything left over is a genuine orphan: buffers created
+     * under `Tile#upload` (which only ever runs for in-view or pinned tiles) whose tile then
+     * left without being unloaded.
+     *
+     * Read `orphans` as a RATE, not a level: a tile that has just left in view can be
+     * mid-teardown for a frame. A count that climbs with the workload is the leak.
+     *
+     * @param limit - how many of the biggest orphan tiles to list individually
+     * @param source - also return a row per live owner tile of this source, held ones
+     * included, each carrying the tile's CURRENT bucket count. A tile owning far more
+     * buffers than its buckets can account for is holding buffers from bucket sets that
+     * were replaced without being destroyed — the leak, seen before the tile dies.
+     */
+    bufferOwnerAudit(limit: number = 8, source?: string) {
+        // Structural, and a plain object rather than a Map: `Map` in this file is the class
+        // being defined, not the global.
+        type OwnedTile = {uid: number; buckets?: {[_: string]: unknown}; state?: string};
+        const held = new Set<number>();
+        const tiles: {[uid: number]: OwnedTile} = {};
+        const note = (tile: OwnedTile) => { if (tile) { held.add(tile.uid); tiles[tile.uid] = tile; } };
+        for (const id in this.style.tileManagers) {
+            const manager = this.style.tileManagers[id];
+            for (const tile of manager._inViewTiles.getAllTiles()) note(tile);
+            for (const key in manager._outOfViewCache.data) {
+                for (const entry of manager._outOfViewCache.data[key]) note(entry.value);
+            }
+            for (const key in manager._preloadedTiles) note(manager._preloadedTiles[key].tile);
+        }
+        // Terrain's RTT tiles are Tile objects outside any style manager; they hold no bucket
+        // buffers today, but counting them keeps a future change from reading as a leak.
+        const terrainTiles = this.terrain?.tileManager?._tiles;
+        for (const key in terrainTiles) note(terrainTiles[key]);
+
+        const totals = {tiles: 0, bytes: 0, buffers: 0};
+        const orphanTotals = {tiles: 0, bytes: 0, buffers: 0};
+        const bySource: {[source: string]: {tiles: number; bytes: number; buffers: number}} = {};
+        const orphans: Array<{uid: number; source: string; key: string; z: number; bytes: number; count: number}> = [];
+        glMemBufferOwners.forEach((owner) => {
+            totals.tiles++;
+            totals.bytes += owner.bytes;
+            totals.buffers += owner.count;
+            if (held.has(owner.uid)) return;
+            orphanTotals.tiles++;
+            orphanTotals.bytes += owner.bytes;
+            orphanTotals.buffers += owner.count;
+            const src = bySource[owner.source] || (bySource[owner.source] = {tiles: 0, bytes: 0, buffers: 0});
+            src.tiles++;
+            src.bytes += owner.bytes;
+            src.buffers += owner.count;
+            orphans.push({...owner});
+        });
+        orphans.sort((a, b) => b.bytes - a.bytes);
+
+        let rows: Array<{uid: number; key: string; z: number; bytes: number; count: number;
+            held: boolean; buckets: number; state: string}> = null;
+        if (source) {
+            rows = [];
+            glMemBufferOwners.forEach((owner) => {
+                if (owner.source !== source) return;
+                const tile = tiles[owner.uid];
+                rows.push({
+                    uid: owner.uid,
+                    key: owner.key,
+                    z: owner.z,
+                    bytes: owner.bytes,
+                    count: owner.count,
+                    held: held.has(owner.uid),
+                    buckets: tile ? Object.keys(tile.buckets || {}).length : -1,
+                    state: tile ? tile.state : '(gone)',
+                });
+            });
+            rows.sort((a, b) => b.count - a.count);
+            rows = rows.slice(0, limit);
+        }
+
+        return {
+            heldTiles: held.size,
+            totals,
+            orphanTotals,
+            bySource,
+            orphans: orphans.slice(0, limit),
+            rows,
+        };
+    }
+
+    /**
+     * PATCH (map2-fork, leak probe): record a creation stack for every buffer charged to a
+     * tile that already owns more than `threshold` of them, and count identical sites.
+     * A tile owns a handful legitimately, so past the threshold every creation is suspect and
+     * the top site is the leak's call path. 0 turns it off (and clears the counts).
+     */
+    setBufferStackWatch(threshold: number): this {
+        setBufferOwnerStackThreshold(threshold);
+        return this;
+    }
+
+    /** The creation sites recorded by {@link Map#setBufferStackWatch}, most frequent first. */
+    bufferStackReport(limit: number = 5): Array<{count: number; stack: string}> {
+        const out: Array<{count: number; stack: string}> = [];
+        glMemOwnerStackCounts.forEach((count, stack) => out.push({count, stack}));
+        out.sort((a, b) => b.count - a.count);
+        return out.slice(0, limit);
     }
 
     /**

@@ -10,7 +10,7 @@ import {now} from '../util/time_control';
 import {toEvaluationFeature} from '../data/evaluation_feature';
 import {EvaluationParameters} from '../style/evaluation_parameters';
 import {rtlMainThreadPluginFactory} from '../source/rtl_text_plugin_main_thread';
-import {setBufferMemTag} from '../webgl/gl_stats';
+import {setBufferMemTag, setBufferMemOwner} from '../webgl/gl_stats';
 
 const CLOCK_SKEW_RETRY_TIMEOUT = 30000;
 
@@ -54,9 +54,13 @@ export type TileState = 'loading' | 'loaded' | 'reloading' | 'unloaded' | 'error
  * `deserialize`. A bucket whose layers all vanished from the style is possible in principle
  * (a style edit racing an in-flight tile), so the source falls back rather than throwing.
  */
-function bucketMemTag(bucket: Bucket, layerId: string): string {
+function bucketSourceId(bucket: Bucket): string {
     const layer = bucket.layers && bucket.layers.length ? bucket.layers[0] : null;
-    return `${layer && layer.source ? layer.source : '?'}/${layerId}`;
+    return layer && layer.source ? layer.source : '?';
+}
+
+function bucketMemTag(bucket: Bucket, layerId: string): string {
+    return `${bucketSourceId(bucket)}/${layerId}`;
 }
 
 /** @internal */
@@ -379,11 +383,16 @@ export class Tile {
                 // layout share one bucket), so the tag names the family, not every member.
                 // try/finally because a stale tag would silently mis-attribute everything
                 // uploaded after it, which is worse than the error that caused it.
+                // The same buffers are also charged to THIS TILE (by uid), which is what
+                // Map#bufferOwnerAudit joins against the manager's retention stores to find
+                // buffers outliving their tile — handover §4.23.
                 setBufferMemTag(bucketMemTag(bucket, id));
+                setBufferMemOwner(this, bucketSourceId(bucket));
                 try {
                     bucket.upload(context);
                 } finally {
                     setBufferMemTag(null);
+                    setBufferMemOwner(null);
                 }
             }
         }

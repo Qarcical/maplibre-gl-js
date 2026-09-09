@@ -213,6 +213,95 @@ export function currentBufferMemTag(): string {
 }
 
 /**
+ * PATCH (map2-fork, 2026-09-09): the SAME buffer bytes attributed to the TILE that uploaded
+ * them, rather than to the layer.
+ *
+ * `[bufmem]` answers "which layer holds the geometry". It cannot answer "do buffers outlive
+ * the tile that made them", which is what the anim-track leak looks like: ~300 live buffers
+ * on a geojson source whose manager holds 2-6 tiles (handover §4.23). Owners are keyed by
+ * `Tile#uid` — the tile OBJECT's identity, not its tile id, because two objects for the same
+ * id are exactly what has to be told apart here.
+ *
+ * Same rules as the tag map above: tracked unconditionally, and each buffer stores the uid it
+ * was charged to rather than re-deriving one at destroy time. Difference: entries are DELETED
+ * when they reach zero. Tags are bounded by the style's layer count; owners are bounded by
+ * live tiles — plus precisely the leaked ones this exists to find.
+ */
+export type GlMemOwner = {uid: number; source: string; key: string; z: number; bytes: number; count: number};
+
+/** Structural on purpose: importing Tile into this leaf module would be an import cycle. */
+type BufferOwnerTile = {uid: number; tileID: {key: string; overscaledZ: number}};
+
+export const glMemBufferOwners: Map<number, GlMemOwner> = new Map();
+
+let currentBufferOwner: BufferOwnerTile | null = null;
+let currentBufferOwnerSource: string = '?';
+
+/** Set by Tile#upload around a bucket's upload, alongside the layer tag. */
+export function setBufferMemOwner(tile: BufferOwnerTile | null, source?: string) {
+    currentBufferOwner = tile;
+    currentBufferOwnerSource = source || '?';
+}
+
+/** Charge bytes to the tile currently uploading; returns the uid to credit back, 0 for none. */
+export function addOwnedBufferBytes(bytes: number): number {
+    const tile = currentBufferOwner;
+    if (!tile) return 0;
+    const entry = glMemBufferOwners.get(tile.uid);
+    if (entry) {
+        entry.bytes += bytes;
+        entry.count++;
+        if (ownerStackThreshold > 0 && entry.count > ownerStackThreshold) {
+            recordOwnerStack();
+        }
+    } else {
+        glMemBufferOwners.set(tile.uid, {
+            uid: tile.uid,
+            source: currentBufferOwnerSource,
+            key: tile.tileID.key,
+            z: tile.tileID.overscaledZ,
+            bytes,
+            count: 1,
+        });
+    }
+    return tile.uid;
+}
+
+/**
+ * PATCH (map2-fork, leak probe): where the SURPLUS buffers are created.
+ *
+ * A tile legitimately owns a handful of buffers; the leak shows up as hundreds on one tile,
+ * so every creation past a threshold is by definition suspect. Recording the stack for those
+ * and counting identical sites names the call path directly, which reading the upload/destroy
+ * pairs could not. Off (0) unless Map#setBufferStackWatch turns it on — `new Error().stack`
+ * in a buffer constructor is far too expensive to leave on.
+ */
+export const glMemOwnerStackCounts: Map<string, number> = new Map();
+let ownerStackThreshold = 0;
+
+export function setBufferOwnerStackThreshold(n: number) {
+    ownerStackThreshold = n;
+    glMemOwnerStackCounts.clear();
+}
+
+function recordOwnerStack() {
+    const stack = (new Error().stack || '').split('\n').slice(2, 9)
+        .map(s => s.trim().replace(/^at /, '').replace(/ \(.*\)$/, '').replace(/https?:\S+/, ''))
+        .join(' <- ');
+    glMemOwnerStackCounts.set(stack, (glMemOwnerStackCounts.get(stack) || 0) + 1);
+}
+
+export function removeOwnedBufferBytes(uid: number, bytes: number) {
+    const entry = glMemBufferOwners.get(uid);
+    if (!entry) return;
+    entry.bytes -= bytes;
+    entry.count--;
+    if (entry.count <= 0) {
+        glMemBufferOwners.delete(uid);
+    }
+}
+
+/**
  * Live tags by resident bytes, biggest first. Empty tags are dropped from the report but
  * kept in the map — a layer that has just been released should read as gone, not linger.
  */

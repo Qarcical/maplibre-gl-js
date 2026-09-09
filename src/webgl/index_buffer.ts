@@ -2,7 +2,8 @@
 import type {StructArray} from '../util/struct_array';
 import type {TriangleIndexArray, LineIndexArray, LineStripIndexArray} from '../data/index_array_type';
 import type {Context} from './context';
-import {glStats, glMem, currentBufferMemTag, addTaggedBufferBytes, removeTaggedBufferBytes} from './gl_stats';
+import {glStats, glMem, currentBufferMemTag, addTaggedBufferBytes, removeTaggedBufferBytes,
+    addOwnedBufferBytes, removeOwnedBufferBytes} from './gl_stats';
 
 /**
  * @internal
@@ -17,6 +18,8 @@ export class IndexBuffer {
     private _memBytes: number = 0;
     // Captured at construction, never re-derived — destroy() must credit the same bucket.
     private _memTag: string;
+    // Likewise the owning tile's uid (0 = created outside a tile upload) — the leak probe.
+    private _memOwner: number = 0;
 
     constructor(context: Context, array: TriangleIndexArray | LineIndexArray | LineStripIndexArray, dynamicDraw?: boolean) {
         this.context = context;
@@ -36,6 +39,7 @@ export class IndexBuffer {
         glMem.bufferCount++;
         this._memTag = currentBufferMemTag();
         addTaggedBufferBytes(this._memTag, this._memBytes);
+        this._memOwner = addOwnedBufferBytes(this._memBytes);
         if (glStats.enabled) {
             glStats.frame.bufferUploads++;
             glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
@@ -73,6 +77,7 @@ export class IndexBuffer {
             glMem.bufferBytes -= this._memBytes;
             glMem.bufferCount--;
             removeTaggedBufferBytes(this._memTag, this._memBytes);
+            removeOwnedBufferBytes(this._memOwner, this._memBytes);
             this._memBytes = 0;
         }
     }

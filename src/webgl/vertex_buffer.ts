@@ -6,7 +6,8 @@ import type {
 
 import type {Program} from './program';
 import type {Context} from './context';
-import {glStats, glMem, currentBufferMemTag, addTaggedBufferBytes, removeTaggedBufferBytes} from './gl_stats';
+import {glStats, glMem, currentBufferMemTag, addTaggedBufferBytes, removeTaggedBufferBytes,
+    addOwnedBufferBytes, removeOwnedBufferBytes} from './gl_stats';
 
 /**
  * An Enum for AttributeType
@@ -39,6 +40,8 @@ export class VertexBuffer {
     // The tag is captured at construction and never re-derived: destroy() must credit the
     // same bucket the bytes were charged to, and by then the upload funnel has moved on.
     private _memTag: string;
+    // Likewise the owning tile's uid (0 = created outside a tile upload) — the leak probe.
+    private _memOwner: number = 0;
 
     /**
      * @param dynamicDraw - Whether this buffer will be repeatedly updated.
@@ -59,6 +62,7 @@ export class VertexBuffer {
         glMem.bufferCount++;
         this._memTag = currentBufferMemTag();
         addTaggedBufferBytes(this._memTag, this._memBytes);
+        this._memOwner = addOwnedBufferBytes(this._memBytes);
         if (glStats.enabled) {
             glStats.frame.bufferUploads++;
             glStats.frame.bufferUploadBytes += array.arrayBuffer.byteLength;
@@ -128,6 +132,7 @@ export class VertexBuffer {
             glMem.bufferBytes -= this._memBytes;
             glMem.bufferCount--;
             removeTaggedBufferBytes(this._memTag, this._memBytes);
+            removeOwnedBufferBytes(this._memOwner, this._memBytes);
             this._memBytes = 0;
         }
     }
