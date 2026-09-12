@@ -4170,10 +4170,85 @@ export class Map extends Camera {
             framePerf,
             mem,
             bufTop,
+            pins: this.preloadAudit(),
+            popIn: this.popInAudit(),
         }));
         // keep the last frame so getGlStats stays readable between reports
         this._glStatsFrames = [this._glStatsFrames[this._glStatsFrames.length - 1]];
         this._glStatsLastReport = timestamp;
+    }
+
+    /**
+     * PATCH (map2-fork, 2026-09-10): per-source pin outcomes — what fraction of the prefetch
+     * was ever used, weighted by the GL bytes each pin held.
+     *
+     * See `PreloadStats` in tile_manager for why the fork's existing `preload TTL:
+     * never-promoted` line cannot answer this (the app's own per-chapter releases beat the TTL
+     * sweep to almost every pin, so it reads near-zero on runs that are pinning heavily).
+     *
+     * CUMULATIVE since the manager was created. Difference two samples for an interval; read
+     * the last one before a crash for the whole run. Sources that have never pinned are
+     * omitted — most styles pin on two or three of a dozen sources.
+     */
+    preloadAudit() {
+        const out: Array<{source: string; pinned: number; promoted: number; wasted: number;
+            promotedMB: number; wastedMB: number; rescued: number; rescuedMB: number;
+            dedup: number; fromCache: number; ttl: number;}> = [];
+        for (const id in this.style.tileManagers) {
+            const s = this.style.tileManagers[id]._preloadStats;
+            if (!s.pinned) continue;
+            const mb = (b: number) => Math.round(b / 1048576);
+            out.push({
+                source: id,
+                pinned: s.pinned,
+                promoted: s.promoted,
+                // Released, then reached anyway through the LRU — the prepay paid off by the other
+                // route, so this is NOT waste. Subtract it before quoting `wasted` at anything.
+                rescued: s.rescued,
+                rescuedMB: mb(s.rescuedBytes),
+                // Both no-promotion exits together: an explicit release and a TTL sweep are the
+                // same outcome for the user (bytes fetched, parsed, uploaded, never displayed);
+                // `ttl` stays broken out because it additionally means a release was missing.
+                wasted: s.released + s.ttl,
+                promotedMB: mb(s.promotedBytes),
+                wastedMB: mb(s.releasedBytes + s.ttlBytes),
+                dedup: s.dedup,
+                fromCache: s.fromCache,
+                ttl: s.ttl,
+            });
+        }
+        return out.sort((a, b) => b.wastedMB - a.wastedMB || b.wasted - a.wasted);
+    }
+
+    /**
+     * PATCH (map2-fork, 2026-09-10): per-source pop-in — how often an ideal tile was drawn as
+     * a scaled ancestor (`coarse`) or as nothing at all (`blank`), and how much of that
+     * happened at a SETTLED camera, which is the part a user would call a defect.
+     *
+     * The metric a prefetch cap has to be judged against alongside bytes. See `PopInStats`.
+     * Cumulative, same reading rules as `preloadAudit`.
+     */
+    popInAudit() {
+        const out: Array<{source: string; ideal: number; coarse: number; coarseDepth: number;
+            blank: number; worstDepth: number; coarseAtRest: number; blankAtRest: number;}> = [];
+        for (const id in this.style.tileManagers) {
+            const s = this.style.tileManagers[id]._popInStats;
+            if (!s.coarse && !s.blank) continue;
+            out.push({
+                source: id,
+                ideal: s.ideal,
+                coarse: s.coarse,
+                // The SUM, not the mean: every field here has to be differenceable between two
+                // samples, and a mean is not. Analysis divides by the matching `coarse` delta.
+                coarseDepth: s.coarseDepth,
+                blank: s.blank,
+                // The one exception — a run-max, so it can be read but not differenced.
+                worstDepth: s.worstDepth,
+                coarseAtRest: s.coarseAtRest,
+                blankAtRest: s.blankAtRest,
+            });
+        }
+        return out.sort((a, b) => (b.blank + b.coarse) - (a.blank + a.coarse));
     }
 
     /**

@@ -116,6 +116,13 @@ export class Tile {
     // low priority so a prefetch burst yields to interactive work (per-frame GeoJSON setData).
     // Cleared on promotion to in-view / unpinning, so any later reload is normal priority.
     isPreload?: boolean;
+    /**
+     * PATCH (map2-fork): this tile was pinned by a preload at some point. Unlike `isPreload` it is
+     * NEVER cleared — it is the audit trail the pin-outcome counters need to spot a RESCUE, i.e. a
+     * released pin the camera later reached through the out-of-view LRU. Without it every released
+     * pin scores as waste even when the prepay paid off through the other store.
+     */
+    wasPinned?: boolean;
     vtLayers: {[_: string]: VectorTileLayerLike};
 
     neighboringTiles: Record<string, {backfilled: boolean}>;

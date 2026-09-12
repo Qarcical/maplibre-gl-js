@@ -300,6 +300,10 @@ export type FlightPreloadSample = {
     margin?: boolean;
 };
 
+// PATCH (map2-fork): which preloaded viewports take the one-tile margin around their cover —
+// every sample, destination-class samples only, or none. See Camera#_preloadMarginDem.
+export type PreloadMarginMode = 'all' | 'dest' | 'none';
+
 export abstract class Camera extends Evented {
     transform: ITransform;
     cameraHelper: ICameraHelper;
@@ -1876,6 +1880,42 @@ export abstract class Camera extends Evented {
      */
     setPathPreloadCoarseDrop(drop: number): this {
         this._pathPreloadCoarseDrop = drop;
+        return this;
+    }
+
+    /**
+     * PATCH (map2-fork): which preloads take the one-tile margin around their cover, per source
+     * family. See TileManager.preloadTiles for what the margin is and the two field defects it
+     * was added for; this only decides WHICH samples pay for it.
+     *
+     * - `'all'`  — every preloaded viewport, intermediate flight samples included.
+     * - `'dest'` — destination-class preloads only (preloadCamera, and a flight's landing sample).
+     * - `'none'` — never.
+     *
+     * The defaults reproduce the pre-knob behaviour exactly: raster-dem `'all'`, vector `'dest'`.
+     * That asymmetry is the point of the knob — a 1.6 s flight fans out into ~22 sampled
+     * viewports, so dem pays the 3×3 margin ~22 times where vector pays it once, which is the
+     * structural reason dem carries ~2.3× composite's pins on the same flights and wastes 88% of
+     * its pinned bytes (handover §4.31 item 7). Judge a change on `[pins]` waste AND post-boot,
+     * at-rest `[popin]` — both margins exist because of real pop-in defects (hillshade tile-holes
+     * 2026-08-07; the canals Taunton z12 column 2026-08-17).
+     *
+     * The challenge app's `?demmargin=` / `?vecmargin=` A/B.
+     */
+    _preloadMarginDem: PreloadMarginMode = 'all';
+    _preloadMarginVector: PreloadMarginMode = 'dest';
+
+    /**
+     * PATCH (map2-fork): override the preload margin policy (see _preloadMarginDem). Omitted
+     * fields are left alone, so either family can be A/B'd on its own.
+     */
+    setPreloadMargin(modes: {dem?: PreloadMarginMode; vector?: PreloadMarginMode}): this {
+        if (modes.dem) {
+            this._preloadMarginDem = modes.dem;
+        }
+        if (modes.vector) {
+            this._preloadMarginVector = modes.vector;
+        }
         return this;
     }
 

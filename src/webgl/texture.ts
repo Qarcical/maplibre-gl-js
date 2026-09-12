@@ -49,6 +49,16 @@ export class Texture {
     private _memIsPool: boolean = false;
     private _memIsDem: boolean = false;
 
+    /**
+     * PATCH (map2-fork): this texture's resident bytes, for callers that need to weight a
+     * single tile rather than read the whole gauge — the preload pin audit, where a raster-dem
+     * tile's cost is ENTIRELY its texture and the per-tile buffer owners (which track vertex
+     * and index buffers only) would score it zero.
+     */
+    memBytes(): number {
+        return this._memBytes;
+    }
+
     constructor(context: Context, image: TextureImage, format: TextureFormat, options?: {
         premultiply?: boolean;
         useMipmap?: boolean;

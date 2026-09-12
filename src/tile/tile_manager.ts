@@ -18,6 +18,7 @@ import {GEOJSON_TILE_LAYER_NAME} from '../data/feature_index';
 import {hasRasterTransition, isRasterType, updateFadingTiles} from './tile_manager_raster';
 import {backfillDEM} from './tile_manager_raster_dem';
 import {InViewTiles} from './tile_manager_in_view_tiles';
+import {glMemBufferOwners} from '../webgl/gl_stats';
 
 import type {Context} from '../webgl/context';
 import type {Source} from '../source/source';
@@ -38,6 +39,101 @@ type TileResult = {
     queryGeometry: Point[];
     cameraQueryGeometry: Point[];
     scale: number;
+};
+
+/**
+ * PATCH (map2-fork, 2026-09-10): does a pin ever get USED?
+ *
+ * The preload pin store is the largest retention store and the only UNCAPPED one — the
+ * viewport bounds `_inViewTiles` and `setMaxSize` bounds `_outOfViewCache`, while
+ * `_preloadedTiles` is limited only by a TTL and the app's own release calls. It tracks the
+ * footprint at r=+0.90 and ~5.4MB per pinned composite tile (handover §4.20). So before any
+ * cap is designed, the question is what fraction of the prepay was never used.
+ *
+ * The TTL sweep's `never-promoted` log line CANNOT answer that any more. Since the app began
+ * releasing pins per chapter and per browse-settle (§4.5/§4.6) almost nothing survives long
+ * enough to be swept: whole 50- and 90-chapter field runs log ZERO TTL lines, because
+ * releasePreloadedTiles() unpinned everything silently first. That line now measures only
+ * the pins the app FORGOT to release, which is close to none — a survivorship artefact, not
+ * a waste figure.
+ *
+ * Counted here instead, at every exit a pin has, and weighted by the GL bytes the tile was
+ * actually holding: a never-promoted Lake District tile costs ~8× a lowland one, so counts
+ * alone would misrank regions. Bytes come from `glMemBufferOwners` — pinned tiles really are
+ * uploaded to GL (see `_uploadPreloadedTiles`), which is why they show up in `buf` at all.
+ *
+ * CUMULATIVE for the life of the manager. Two samples differ by the interval's activity, so
+ * analysis differences them; a lifetime total is also what the last line before a jetsam kill
+ * should carry.
+ */
+export type PreloadStats = {
+    /** new pins created — a fetch + worker parse was started, or an LRU tile was pinned */
+    pinned: number;
+    /** the covering tile was already in view: the preload asked for nothing */
+    inView: number;
+    /** already pinned by an earlier sample or call; the pin's TTL was refreshed */
+    dedup: number;
+    /** subset of `pinned` satisfied from the out-of-view LRU — no fetch, no parse */
+    fromCache: number;
+    /** pins promoted into the in-view set — the camera arrived and the prepay paid off */
+    promoted: number;
+    promotedBytes: number;
+    /** pins dropped by releasePreloadedTiles having never been promoted — the waste */
+    released: number;
+    releasedBytes: number;
+    /** pins dropped by the TTL sweep having never been promoted — waste AND a missing release */
+    ttl: number;
+    ttlBytes: number;
+    /**
+     * released pins the camera later landed on ANYWAY, via the out-of-view LRU (`_unpinTile`
+     * hands a loaded tile to the cache rather than discarding it). The prepay still paid off, so
+     * these must be subtracted from `released` before calling anything waste.
+     */
+    rescued: number;
+    rescuedBytes: number;
+};
+
+/**
+ * PATCH (map2-fork, 2026-09-10): how often is the user shown something other than the tile
+ * that belongs there?
+ *
+ * Every prefetch cap trades bytes for pop-in, and there has never been a pop-in metric — so
+ * every cap so far could only be judged on bytes, which is how a cap ships a regression that
+ * surfaces later as an eyes-on "it pops now". Measured at the one place that already decides
+ * the question per ideal tile, `_updateRetainedTiles`.
+ *
+ * Two classes, deliberately separate because they are not equally bad:
+ *  - `coarse` — an ancestor is drawn scaled up in the ideal tile's place. Usually benign: the
+ *    child arriving later is a SHARPENING. It is NOT benign for layers whose data begins at a
+ *    zoom (buildings, ditches, contour bands): the parent has nothing for them, so the whole
+ *    layer appears at once when the fine ring lands (2026-08-17 canals Taunton). `depth`
+ *    is the proxy for that risk — the further up the substitute, the more data-minzoom
+ *    boundaries it has crossed.
+ *  - `blank` — nothing renderable anywhere in the ladder, ancestor or descendant. A hole.
+ *
+ * And `atRest` splits both by whether the camera was moving. Substitution DURING a flight is
+ * the mechanism working (coarse rings are what the mid-path clamp deliberately buys); the
+ * same thing at a settled camera means the tile never arrived, which is the defect a user
+ * reports. Judge a cap on the at-rest numbers.
+ *
+ * Unit is TILE-FRAMES (one ideal tile, one update), so it is a rate, not a level, and
+ * `coarse/ideal` is comparable across devices and frame rates. Cumulative, like PreloadStats.
+ */
+export type PopInStats = {
+    /** ideal tile-frames considered */
+    ideal: number;
+    /** ideal tile-frames drawn from an ANCESTOR (no data of their own, no child coverage) */
+    coarse: number;
+    /** summed ancestor depth in zoom levels over those, for a mean */
+    coarseDepth: number;
+    /** deepest ancestor substitution seen, in zoom levels */
+    worstDepth: number;
+    /** ideal tile-frames with nothing renderable in the ladder at all */
+    blank: number;
+    /** subset of `coarse` recorded while the camera was NOT moving */
+    coarseAtRest: number;
+    /** subset of `blank` recorded while the camera was NOT moving */
+    blankAtRest: number;
 };
 
 /**
@@ -83,6 +179,19 @@ export class TileManager extends Evented {
     _preloadedTiles: Record<string, {tile: Tile; staleAfterUpdate: number}> = {};
     // PATCH (map2-fork): update() counter driving the pin TTL sweep (see preloadedTileTTLUpdates).
     _updateCount: number = 0;
+    // PATCH (map2-fork): cumulative pin-outcome and substitution counters. See PreloadStats /
+    // PopInStats above for what each field means and why they exist.
+    _preloadStats: PreloadStats = {
+        pinned: 0, inView: 0, dedup: 0, fromCache: 0,
+        promoted: 0, promotedBytes: 0,
+        released: 0, releasedBytes: 0,
+        ttl: 0, ttlBytes: 0,
+        rescued: 0, rescuedBytes: 0,
+    };
+    _popInStats: PopInStats = {
+        ideal: 0, coarse: 0, coarseDepth: 0, worstDepth: 0, blank: 0,
+        coarseAtRest: 0, blankAtRest: 0,
+    };
     _timers: Record<string, ReturnType<typeof setTimeout>>;
     _maxTileCacheSize: number;
     _maxTileCacheZoomLevels: number;
@@ -771,7 +880,10 @@ export class TileManager extends Evented {
         let ttlExpired = 0;
         for (const key in this._preloadedTiles) {
             if (this._preloadedTiles[key].staleAfterUpdate < this._updateCount) {
-                this._unpinTile(this._preloadedTiles[key].tile);
+                const tile = this._preloadedTiles[key].tile;
+                this._preloadStats.ttl++;
+                this._preloadStats.ttlBytes += this._pinBytes(tile);
+                this._unpinTile(tile);
                 delete this._preloadedTiles[key];
                 ttlExpired++;
             }
@@ -838,7 +950,20 @@ export class TileManager extends Evented {
         // (buildings, ditches, contour sets): a leaked edge column loads reactively on arrival
         // and the whole layer pops in there (2026-08-17 canals Taunton, one z12 column past the
         // window prefetch). Intermediate path samples overlap densely and pass margin=false.
-        const takeMargin = this._source.type === 'raster-dem' || (margin && this._source.type === 'vector');
+        //
+        // Both policies are now knobbed per source family (Camera#_preloadMarginDem /
+        // _preloadMarginVector, the app's `?demmargin=` / `?vecmargin=`). Defaults reproduce
+        // exactly what is described above — dem 'all', vector 'dest' — and the asymmetry is
+        // what the knob exists to A/B: a flight fans out into ~22 sampled viewports, so dem
+        // pays this 3×3 margin ~22 times per flight where vector pays it once (handover §4.31
+        // item 7: dem carries 2,669 pins against composite's 1,161 and wastes 88% of its bytes).
+        const marginMode = this._source.type === 'raster-dem'
+            ? (this.map?._preloadMarginDem ?? 'all')
+            : this._source.type === 'vector'
+                ? (this.map?._preloadMarginVector ?? 'dest')
+                : 'none';
+        const takeMargin = marginMode === 'all' || (marginMode === 'dest' && !!margin);
+        let marginAdded = 0;
         if (takeMargin && idealTileIDs.length > 0) {
             const seen = new Set(idealTileIDs.map((id) => id.key));
             const margin: OverscaledTileID[] = [];
@@ -859,6 +984,7 @@ export class TileManager extends Evented {
                     }
                 }
             }
+            marginAdded = margin.length;
             idealTileIDs = idealTileIDs.concat(margin);
         }
         if (this._source.hasTile) {
@@ -870,6 +996,7 @@ export class TileManager extends Evented {
         for (const tileID of idealTileIDs) {
             if (this._inViewTiles.getTileById(tileID.key)) {
                 inView++;
+                this._preloadStats.inView++;
                 continue;
             }
             const pinned = this._preloadedTiles[tileID.key];
@@ -877,22 +1004,26 @@ export class TileManager extends Evented {
                 // re-preloading signals renewed interest — refresh the pin's TTL
                 pinned.staleAfterUpdate = this._updateCount + TileManager.preloadedTileTTLUpdates;
                 alreadyPinned++;
+                this._preloadStats.dedup++;
                 continue;
             }
             let tile = this._outOfViewCache.getAndRemove(tileID);
             if (tile) {
                 fromCache++;
+                this._preloadStats.fromCache++;
             }
+            this._preloadStats.pinned++;
             if (!tile) {
                 tile = new Tile(tileID, this._source.tileSize * tileID.overscaleFactor());
                 tile.isPreload = true;   // parse at low priority — yield to interactive worker tasks
                 this._source.fire(new Event('dataloading', {tile, coord: tile.tileID, dataType: 'source'}));
                 loads.push(this._loadTile(tile, tileID.key, tile.state));
             }
+            tile.wasPinned = true;   // audit trail for RESCUE detection in _addTile
             this._preloadedTiles[tileID.key] = {tile, staleAfterUpdate: this._updateCount + TileManager.preloadedTileTTLUpdates};
         }
         if (debug) {
-            console.log(`[map2-fork] preload '${this.id}': ${idealTileIDs.length} covering → ${loads.length} new loads, ${fromCache} from cache, ${alreadyPinned} already pinned, ${inView} in view`);
+            console.log(`[map2-fork] preload '${this.id}': ${idealTileIDs.length} covering (${marginAdded} margin, mode ${marginMode}${takeMargin ? '' : ', not taken'}) → ${loads.length} new loads, ${fromCache} from cache, ${alreadyPinned} already pinned, ${inView} in view`);
         }
         await Promise.allSettled(loads);
     }
@@ -903,9 +1034,32 @@ export class TileManager extends Evented {
         if (entry) {
             delete this._preloadedTiles[tileID.key];
             entry.tile.isPreload = false;   // in view now — any later reload is interactive
+            this._preloadStats.promoted++;
+            this._preloadStats.promotedBytes += this._pinBytes(entry.tile);
             return entry.tile;
         }
         return undefined;
+    }
+
+    /**
+     * PATCH (map2-fork): the GL bytes a pin is holding right now, for weighting the pin-outcome
+     * counters. Read BEFORE `_unpinTile`, which unloads (and so un-charges) anything not fully
+     * loaded. 0 is a real answer, not a gap: a pin whose upload the scheduler has not granted
+     * yet holds worker-parsed data on the JS heap but nothing in GL, and `buf` is the term the
+     * crash hunt is about.
+     *
+     * BOTH terms, because the two source families cost their memory in different places and
+     * the DEM half is ~40% of the pin bill (handover §4.20's fit: 0.69MB × dem pins). A vector
+     * tile's cost is its vertex/index buffers, tracked per tile by `glMemBufferOwners`; a
+     * raster-dem tile's is its R32F texture, which those owners do not see at all — scoring it
+     * zero would have said DEM prefetch is free, which is the opposite of what killed the
+     * trigpoints run (§4.26: dem 138 → 279MB in one second).
+     */
+    private _pinBytes(tile: Tile): number {
+        let bytes = glMemBufferOwners.get(tile.uid)?.bytes || 0;
+        if (tile.demTexture) bytes += tile.demTexture.memBytes();
+        if (tile.texture && typeof tile.texture.memBytes === 'function') bytes += tile.texture.memBytes();
+        return bytes;
     }
 
     // PATCH (map2-fork): unpin one tile — still-valid data goes to the LRU (reusable, evictable),
@@ -927,7 +1081,12 @@ export class TileManager extends Evented {
     // The app calls this (via Map#releasePreloadedTiles) when its animation step/sequence ends.
     releasePreloadedTiles() {
         for (const key in this._preloadedTiles) {
-            this._unpinTile(this._preloadedTiles[key].tile);
+            const tile = this._preloadedTiles[key].tile;
+            // Every tile reaching here was pinned and never promoted — this IS the waste, and
+            // until now it was the silent exit that made the TTL line read near-zero.
+            this._preloadStats.released++;
+            this._preloadStats.releasedBytes += this._pinBytes(tile);
+            this._unpinTile(tile);
         }
         this._preloadedTiles = {};
     }
@@ -1022,7 +1181,20 @@ export class TileManager extends Evented {
         // for remaining missing tiles with incomplete child coverage, seek a loaded parent tile
         const checked: Record<string, boolean> = {};
         const minCoveringZoom = Math.max(zoom - TileManager.maxUnderzooming, this._source.minzoom);
+        // PATCH (map2-fork): pop-in accounting. Everything reaching this loop is an ideal tile
+        // with no data of its own AND no child coverage, so each one either finds a renderable
+        // ancestor (`coarse`) or finds nothing at all (`blank`). See PopInStats.
+        //
+        // Not counted before the source has loaded. A geojson overlay is data-less and
+        // parentless for its whole boot window, which scored as 100% blank on the overlay
+        // sources — an overlay that has not arrived yet is not a hole in the map, and since
+        // these counters are cumulative that boot transient would sit in the denominator for
+        // the rest of the run.
+        const measurePopIn = this._sourceLoaded;
+        if (measurePopIn) this._popInStats.ideal += idealTileIDs.length;
+        const atRest = !this.map?.isMoving?.();
         for (const tileID of tileIdsWithoutData) {
+            let substituteDepth = 0;
             let tile = this._inViewTiles.getTileById(tileID.key);
 
             // As we ascend up the tile pyramid of the ideal tile, we check whether the parent
@@ -1051,8 +1223,28 @@ export class TileManager extends Evented {
                     // Save the current values, since they're the parent of the next iteration
                     // of the parent tile ascent loop.
                     parentWasRequested = tile.wasRequested();
-                    if (hasData) break;
+                    if (hasData) {
+                        substituteDepth = tileID.overscaledZ - overscaledZ;
+                        break;
+                    }
                 }
+            }
+            // PATCH (map2-fork): `break`ing out of the ascent on `checked` means another child
+            // already walked this route — it found whatever there was to find, so treat this as
+            // covered rather than blank and let that child's sample carry the depth. Only a
+            // genuinely exhausted ascent counts as a hole.
+            if (!measurePopIn) {
+                // source still loading — see measurePopIn above
+            } else if (substituteDepth > 0) {
+                this._popInStats.coarse++;
+                this._popInStats.coarseDepth += substituteDepth;
+                if (substituteDepth > this._popInStats.worstDepth) {
+                    this._popInStats.worstDepth = substituteDepth;
+                }
+                if (atRest) this._popInStats.coarseAtRest++;
+            } else if (!this._hasRenderableSubstitute(tileID)) {
+                this._popInStats.blank++;
+                if (atRest) this._popInStats.blankAtRest++;
             }
         }
 
@@ -1068,7 +1260,22 @@ export class TileManager extends Evented {
             return tile;
 
         // PATCH (map2-fork): promote a preloaded (pinned) tile before consulting the LRU cache.
-        tile = this._takePreloadedTile(tileID) ?? this._outOfViewCache.getAndRemove(tileID);
+        tile = this._takePreloadedTile(tileID);
+        if (!tile) {
+            tile = this._outOfViewCache.getAndRemove(tileID);
+            // PATCH (map2-fork): a RESCUE — an unpinned preload arriving via the LRU instead.
+            // Releasing a pin does not throw the tile away: `_unpinTile` hands a loaded one to
+            // `_outOfViewCache`, so the camera can still land on it and skip the fetch+parse the
+            // preload paid for. Without this the pin-outcome counters call that tile "wasted",
+            // which overstates the waste — the prepay worked, just through the other store. The
+            // LRU is small (~30 tiles) so most released pins really are lost, but "not promoted"
+            // and "fetched for nothing" are not the same thing and the prefetch decision rests on
+            // telling them apart.
+            if (tile?.wasPinned) {
+                this._preloadStats.rescued++;
+                this._preloadStats.rescuedBytes += this._pinBytes(tile);
+            }
+        }
         if (tile) {
             //reset fading logic to remove stale fading data from cache
             tile.resetFadeLogic();
